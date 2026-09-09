@@ -6,10 +6,11 @@ YOLO + DeepSORTによる人物追跡と、DeepFaceによる登録人物照合を
 
 - YOLOで検出した人物をDeepSORTの`track_id`で追跡します。
 - `person_appeared`、`person_disappeared`を`kokomi_kernel`へ送ります。
-- 顔照合は追跡ループとは別の1ワーカースレッドで低頻度に実行します。
-- 同じ登録人物との一致が連続したときだけ`person_recognized`を送ります。
-- 未登録の場合は`person_unknown`を一度だけ送ります。
-- 登録時は顔画像ではなく顔特徴ベクトルだけを`data/face_registry.json`へ保存します。
+- 顔照合は追跡ループとは別のワーカースレッドで実行します。
+- RetinaFaceで検出・位置合わせし、小さすぎる顔、ぼけ、露出不良を除外します。
+- Facenet512の複数フレーム投票で人物を確定し、単発の誤判定を抑えます。
+- 未登録判定は十分な時間と高品質な不一致サンプルがそろうまで保留します。
+- 登録時は最大30秒間サンプルを集め、外れ値と重複を除いた複数の特徴ベクトルを保存します。顔画像は保存しません。
 
 ## セットアップ
 
@@ -21,7 +22,24 @@ pip install -r face-recognition-requirements.txt
 python deepsort.py
 ```
 
-DeepFace/SFaceのモデルファイルは初回利用時に取得されます。
+DeepFace/Facenet512とRetinaFaceのモデルファイルは初回利用時に取得されます。
+
+## ローカル確認UI
+
+`deepsort.py`を起動して、ブラウザで次を開きます。
+
+```text
+http://localhost:5000/
+```
+
+Aliceや`kokomi_kernel`を起動しなくても、以下を確認・操作できます。
+
+- 追跡ラベル付きカメラ映像
+- カメラ、DeepFaceワーカー、イベント送信の稼働状態
+- 現在の`track_id`、照合状態、最近傍候補、コサイン距離
+- 登録済み人物と保存されている特徴量サンプル数
+- 現在見えている人物の顔登録
+- Aliceへの人物・顔イベント送信のON/OFF
 
 主な環境変数：
 
@@ -34,14 +52,35 @@ DeepFace/SFaceのモデルファイルは初回利用時に取得されます。
 | `VISION_HTTP_HOST` | `127.0.0.1` | HTTP APIの待受アドレス |
 | `VISION_HTTP_PORT` | `5000` | HTTP APIの待受ポート |
 | `VISION_DISPLAY_ENABLED` | `true` | OpenCVウィンドウ表示 |
+| `VISION_UI_STREAM_FPS` | `30` | ブラウザ映像の最大配信fps（最大120） |
+| `VISION_UI_JPEG_QUALITY` | `90` | ブラウザ映像のJPEG品質（50〜100） |
+| `VISION_YOLO_CONFIDENCE` | `0.50` | 人物検出として採用する最低信頼度 |
+| `VISION_YOLO_MIN_PERSON_WIDTH` | `40` | 人物候補の最小幅（px） |
+| `VISION_YOLO_MIN_PERSON_HEIGHT` | `80` | 人物候補の最小高さ（px） |
+| `VISION_YOLO_MIN_PERSON_AREA_RATIO` | `0.002` | 人物候補が画面に占める最低面積比 |
 | `FACE_RECOGNITION_ENABLED` | `true` | 登録顔照合 |
-| `FACE_MODEL_NAME` | `SFace` | DeepFaceの顔認識モデル |
-| `FACE_DETECTOR_BACKEND` | `opencv` | 顔検出バックエンド |
-| `FACE_MATCH_THRESHOLD` | `0.55` | コサイン距離の一致上限 |
-| `FACE_CONFIRMATIONS` | `2` | 認識確定に必要な連続一致数 |
-| `FACE_UNKNOWN_CONFIRMATIONS` | `5` | 未登録確定に必要な連続不一致数 |
-| `FACE_ANALYSIS_INTERVAL_SECONDS` | `1.0` | 同一トラックの顔解析間隔 |
-| `FACE_REGISTRY_PATH` | `data/face_registry.json` | 登録データ保存先 |
+| `FACE_MODEL_NAME` | `Facenet512` | DeepFaceの顔認識モデル |
+| `FACE_DETECTOR_BACKEND` | `retinaface` | 精度優先の顔検出・位置合わせ |
+| `FACE_MATCH_THRESHOLD` | `0.30` | コサイン距離の一致上限 |
+| `FACE_CONFIRMATIONS` | `3` | 認識確定に必要な投票数 |
+| `FACE_RECOGNITION_WINDOW` | `8` | 認識投票に使う直近サンプル数 |
+| `FACE_RECOGNITION_MIN_VOTE_RATIO` | `0.6` | 認識確定に必要な投票比率 |
+| `FACE_CONSECUTIVE_CONFIRMATIONS` | `2` | 同一人物の連続一致による早期確定回数 |
+| `FACE_UNKNOWN_CONFIRMATIONS` | `40` | 未登録確定に必要な高品質不一致数 |
+| `FACE_UNKNOWN_MIN_SECONDS` | `15.0` | 未登録確定までの最低観測時間 |
+| `FACE_ANALYSIS_INTERVAL_SECONDS` | `0.25` | 同一トラックの顔解析間隔 |
+| `FACE_MIN_FACE_SIZE` | `70` | 採用する顔の最小幅・高さ（px） |
+| `FACE_MIN_DETECTION_CONFIDENCE` | `0.90` | 採用する顔検出信頼度 |
+| `FACE_MIN_BLUR_VARIANCE` | `35.0` | ぼけ除外のしきい値 |
+| `FACE_INPUT_MAX_DIMENSION` | `640` | RetinaFaceへ渡す画像の最大辺（px） |
+| `FACE_PERSON_CROP_TOP_RATIO` | `0.75` | 人物枠の上側から顔を探す範囲 |
+| `FACE_ENROLLMENT_SECONDS` | `30.0` | 非同期登録セッションの最大時間 |
+| `FACE_ENROLLMENT_MIN_SECONDS` | `8.0` | 登録時に観測する最低時間 |
+| `FACE_ENROLLMENT_MIN_SAMPLES` | `4` | 登録成立に必要な一貫した代表サンプル数 |
+| `FACE_ENROLLMENT_TARGET_SAMPLES` | `8` | 登録時に集める目標サンプル数 |
+| `FACE_ENROLLMENT_EXEMPLARS` | `8` | 1回の登録で選ぶ代表特徴量数 |
+| `FACE_MAX_EMBEDDINGS_PER_PERSON` | `12` | 1人あたりの最大保存特徴量数 |
+| `FACE_REGISTRY_PATH` | `data/face_registry_facenet512.json` | 登録データ保存先 |
 | `TRACK_EVENT_STABILITY_SECONDS` | `1.5` | 顔未取得時の出現通知待ち時間 |
 | `TRACK_IDENTITY_WAIT_SECONDS` | `6.0` | 顔取得後に照合結果を待つ上限 |
 
@@ -52,11 +91,91 @@ DeepFace/SFaceのモデルファイルは初回利用時に取得されます。
 - `POST /face-events`：人物・顔イベント送信の有効・無効を実行中に変更
 - `GET /snapshot`：Aliceに渡す生画像
 - `GET /snapshot/annotated`：IDと認識名を描画した確認画像
+- `GET /stream/annotated`：UI用の追跡ラベル付きMJPEGストリーム
 - `GET /tracks`：現在のトラックと認識状態
 - `GET /faces`：登録人物一覧。顔特徴ベクトルは返しません
-- `POST /faces/enroll`：現在のトラックを登録
+- `POST /faces/enroll`：現在のトラックの非同期登録を開始（`202 collecting`）
 
-人物・顔イベントだけを停止しても、カメラ、YOLO、DeepSORT、DeepFace、スナップショットAPIは動作を続けます。OpenCVウィンドウでは`E`キーでも切り替えられます。
+## `kokomi_kernel`へ送るイベント
+
+人物・顔イベントは、既定では次のエンドポイントへHTTP POSTします。
+
+```text
+POST http://localhost:3000/yolo_event
+Content-Type: application/json
+```
+
+送信先は`VISION_EVENT_URL`で変更できます。すべてのイベントは次の共通形式です。
+
+```json
+{
+  "event": {
+    "event_id": "9be54ee461174472b781bac112790c2d",
+    "source": "deepsort",
+    "type": "person_recognized",
+    "track_id": "14",
+    "timestamp": "2026-09-09T06:20:18.123456+00:00",
+    "identity": {
+      "status": "recognized",
+      "person_id": "26b7e2c15a1e4449974367f7da686b74",
+      "name": "KOT",
+      "distance": 0.2563,
+      "threshold": 0.3
+    },
+    "message": "The visible registered person is KOT."
+  }
+}
+```
+
+`event_id`はイベントごとに生成する一意なIDです。同じイベントの再試行では変更しないため、受信側はこの値で重複を除外できます。`timestamp`はUTCのISO 8601形式、`track_id`は文字列です。
+
+### イベント種別
+
+| `type` | 送信条件 | 追加情報 |
+|---|---|---|
+| `person_appeared` | 人物トラックが安定して存在 | `position`に`left`、`center`、`right`のいずれかを設定 |
+| `person_recognized` | 登録人物との照合が確定 | 同一人物の2回連続一致、または通常の複数票で確定 |
+| `person_unknown` | 15秒以上観測し、高品質な不一致が40件連続 | 一時的な顔検出失敗だけでは送信しない |
+| `person_enrolled` | 顔登録がバックグラウンドで完了 | 登録直後なので`identity.distance`は`0.0` |
+| `person_disappeared` | 通知済みの人物トラックが消失 | 最後の`identity`と`position`を設定 |
+
+`identity`は常に以下の5フィールドを持ちます。
+
+| フィールド | 内容 |
+|---|---|
+| `status` | `pending`、`recognized`、`unknown`、`unavailable`のいずれか |
+| `person_id` | 登録人物のID。未確定時は`null` |
+| `name` | 登録名。未確定時は`null` |
+| `distance` | 登録特徴量とのコサイン距離。小さいほど一致。未確定時は`null` |
+| `threshold` | 一致判定に使用した距離の上限 |
+
+### 通常の送信順序
+
+登録人物を約6秒以内に照合できた場合、冗長な`person_appeared`は送らず、直接`person_recognized`を送ります。
+
+```text
+人物出現
+  ├─ 約6秒以内に照合成功
+  │    person_recognized → person_disappeared
+  │
+  ├─ 顔サンプルを取得できない
+  │    1.5秒後 person_appeared(pending) → person_disappeared
+  │
+  └─ 顔は取得できるが未登録
+       6秒後 person_appeared(pending)
+       → 15秒以上かつ不一致40件後 person_unknown
+       → person_disappeared
+```
+
+`person_appeared`送信後に照合が確定した場合は、続けて`person_recognized`または`person_unknown`を送ります。登録セッション中は`person_unknown`を抑制し、登録成功後に`person_enrolled`を送ります。
+
+### 配信とイベントスイッチ
+
+イベントは最大100件の非同期キューから送信します。HTTP送信に失敗した場合は、同じ`event_id`のまま待ち時間`0`、`0.2`、`0.5`、`1.0`秒で最大4回試行します。キューが満杯の場合は新しいイベントを破棄します。
+
+`VISION_EVENT_SEND_ENABLED=false`または実行中の顔イベントスイッチがOFFの場合、人物・顔イベントは送信しません。スイッチをOFFにした時点で待機中のイベントも破棄し、ONへ戻しても過去のイベントは再送しません。カメラ、YOLO、DeepSORT、DeepFace、顔登録、スナップショットAPIはそのまま動作を続けます。
+
+OpenCVウィンドウでは`E`キーでも人物・顔イベント送信を切り替えられます。
 
 ```powershell
 # Aliceへの人物・顔イベントを無効化
@@ -81,4 +200,6 @@ Invoke-RestMethod -Method Post `
   -Body '{"track_id":"7","name":"たかん"}'
 ```
 
-Aliceからは`remember_person`アクションで同じAPIを呼び出せます。顔がまだ正しく取得できていない場合はHTTP 409となり、誤った画像を登録しません。同じ名前で再登録すると、最大5個まで別角度の特徴ベクトルが追加されます。
+Aliceからは`remember_person`アクションで同じAPIを呼び出せます。APIは収集開始時に`202 collecting`を返し、Python側は最大30秒間バックグラウンドで顔を集めます。正面を見てから顔をゆっくり左右へ向けてください。8秒以上かつ目標8サンプルで早期完了し、30秒時点で一貫した代表サンプルが4個未満なら保存しません。進捗と最終結果は`GET /tracks`およびブラウザUIに表示され、成功時は`person_enrolled`イベントがAliceへ送られます。同じ名前で再登録すると、最大12個まで代表特徴ベクトルが追加されます。
+
+以前のSFace登録は`data/face_registry.json`に残りますが、Facenet512の特徴量とは互換性がないため自動変換しません。精度優先構成へ切り替えた初回は人物を再登録してください。
