@@ -1,2 +1,2 @@
-deepface==0.0.100
-tf-keras
+insightface==1.0.1
+onnxruntime-gpu==1.20.2

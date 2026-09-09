@@ -11,24 +11,27 @@ from typing import Optional
 import uuid
 
 import cv2  # type: ignore
-from deep_sort_realtime.deepsort_tracker import DeepSort  # type: ignore
 from flask import Flask, Response, jsonify, render_template, request  # type: ignore
 import requests  # type: ignore
 from ultralytics import YOLO  # type: ignore
+import yaml  # type: ignore
 
 from face_registry import (
-    DeepFaceEncoder,
     FaceEncoding,
     FaceMatch,
     FaceRegistry,
+    InsightFaceEncoder,
     resolve_face_vote,
     select_representative_encodings,
 )
-from vision_filters import is_plausible_person_detection
+from vision_tracking import TrackLifecycle, observations_from_result
+from vision_filters import (
+    is_plausible_person_detection,
+    resolve_duplicate_identity_track,
+)
 
 
 BASE_DIRECTORY = Path(__file__).resolve().parent
-os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -42,6 +45,7 @@ EVENT_SEND_ENABLED = env_bool("VISION_EVENT_SEND_ENABLED", True)
 DISPLAY_ENABLED = env_bool("VISION_DISPLAY_ENABLED", True)
 FACE_RECOGNITION_ENABLED = env_bool("FACE_RECOGNITION_ENABLED", True)
 FACE_EVENT_SEND_DEFAULT_ENABLED = env_bool("FACE_EVENT_SEND_ENABLED", True)
+FACE_REQUIRE_GPU = env_bool("FACE_REQUIRE_GPU", True)
 
 EVENT_URL = os.getenv("VISION_EVENT_URL", "http://localhost:3000/yolo_event")
 EVENT_REQUEST_TIMEOUT_SECONDS = float(os.getenv("VISION_EVENT_REQUEST_TIMEOUT_SECONDS", "10.0"))
@@ -58,13 +62,21 @@ YOLO_MIN_PERSON_HEIGHT = int(os.getenv("VISION_YOLO_MIN_PERSON_HEIGHT", "80"))
 YOLO_MIN_PERSON_AREA_RATIO = float(
     os.getenv("VISION_YOLO_MIN_PERSON_AREA_RATIO", "0.002")
 )
+YOLO_TRACK_CONFIDENCE_THRESHOLD = max(
+    0.0,
+    min(
+        YOLO_CONFIDENCE_THRESHOLD,
+        float(os.getenv("VISION_YOLO_TRACK_CONFIDENCE", "0.10")),
+    ),
+)
 
-FACE_MODEL_NAME = os.getenv("FACE_MODEL_NAME", "Facenet512")
-FACE_DETECTOR_BACKEND = os.getenv("FACE_DETECTOR_BACKEND", "retinaface")
+FACE_MODEL_NAME = os.getenv("FACE_MODEL_NAME", "buffalo_l")
+FACE_DETECTOR_BACKEND = "SCRFD"
 FACE_MODEL_DEFAULT_THRESHOLDS = {
-    "Facenet512": 0.30,
-    "SFace": 0.593,
-    "ArcFace": 0.68,
+    "buffalo_l": 0.55,
+    "antelopev2": 0.55,
+    "buffalo_m": 0.55,
+    "buffalo_s": 0.55,
 }
 FACE_MATCH_THRESHOLD = float(
     os.getenv(
@@ -87,12 +99,22 @@ FACE_MIN_PERSON_WIDTH = int(os.getenv("FACE_MIN_PERSON_WIDTH", "100"))
 FACE_MIN_PERSON_HEIGHT = int(os.getenv("FACE_MIN_PERSON_HEIGHT", "140"))
 FACE_MIN_FACE_SIZE = int(os.getenv("FACE_MIN_FACE_SIZE", "70"))
 FACE_MIN_DETECTION_CONFIDENCE = float(
-    os.getenv("FACE_MIN_DETECTION_CONFIDENCE", "0.90")
+    os.getenv("FACE_MIN_DETECTION_CONFIDENCE", "0.70")
 )
 FACE_MIN_BLUR_VARIANCE = float(os.getenv("FACE_MIN_BLUR_VARIANCE", "35.0"))
 FACE_MIN_BRIGHTNESS = float(os.getenv("FACE_MIN_BRIGHTNESS", "35.0"))
 FACE_MAX_BRIGHTNESS = float(os.getenv("FACE_MAX_BRIGHTNESS", "225.0"))
 FACE_INPUT_MAX_DIMENSION = int(os.getenv("FACE_INPUT_MAX_DIMENSION", "640"))
+FACE_DETECTION_SIZE = int(os.getenv("FACE_DETECTION_SIZE", "640"))
+FACE_MODEL_ROOT = os.getenv("FACE_MODEL_ROOT") or None
+FACE_EXECUTION_PROVIDERS = tuple(
+    provider.strip()
+    for provider in os.getenv(
+        "FACE_EXECUTION_PROVIDERS",
+        "CUDAExecutionProvider,CPUExecutionProvider",
+    ).split(",")
+    if provider.strip()
+)
 FACE_PERSON_CROP_TOP_RATIO = max(
     0.25,
     min(1.0, float(os.getenv("FACE_PERSON_CROP_TOP_RATIO", "0.75"))),
@@ -117,12 +139,15 @@ FACE_ENROLLMENT_CLUSTER_DISTANCE = float(
 FACE_MAX_EMBEDDINGS_PER_PERSON = int(
     os.getenv("FACE_MAX_EMBEDDINGS_PER_PERSON", "12")
 )
+TRACK_MAX_AGE = max(1, int(os.getenv("TRACK_MAX_AGE", "90")))
+TRACKER_CONFIG_PATH = os.getenv(
+    "VISION_TRACKER_CONFIG",
+    str(BASE_DIRECTORY / "botsort.yaml"),
+)
 UI_STREAM_FPS = max(1.0, min(120.0, float(os.getenv("VISION_UI_STREAM_FPS", "30"))))
 UI_JPEG_QUALITY = max(50, min(100, int(os.getenv("VISION_UI_JPEG_QUALITY", "90"))))
 DEFAULT_FACE_REGISTRY_PATH = (
-    BASE_DIRECTORY / "data" / "face_registry.json"
-    if FACE_MODEL_NAME == "SFace"
-    else BASE_DIRECTORY / "data" / f"face_registry_{FACE_MODEL_NAME.lower()}.json"
+    BASE_DIRECTORY / "data" / f"face_registry_{FACE_MODEL_NAME.lower()}.json"
 )
 FACE_REGISTRY_PATH = Path(
     os.getenv(
@@ -130,6 +155,28 @@ FACE_REGISTRY_PATH = Path(
         str(DEFAULT_FACE_REGISTRY_PATH),
     )
 )
+
+
+def prepare_tracker_config() -> str:
+    """Create an effective BoT-SORT config using the runtime thresholds."""
+    source = Path(TRACKER_CONFIG_PATH)
+    if not source.exists():
+        raise FileNotFoundError(f"tracker config does not exist: {source}")
+    payload = yaml.safe_load(source.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("tracker_type") != "botsort":
+        raise ValueError("VISION_TRACKER_CONFIG must contain a BoT-SORT YAML config")
+    payload["track_high_thresh"] = YOLO_CONFIDENCE_THRESHOLD
+    payload["new_track_thresh"] = YOLO_CONFIDENCE_THRESHOLD
+    payload["track_low_thresh"] = YOLO_TRACK_CONFIDENCE_THRESHOLD
+    payload["track_buffer"] = TRACK_MAX_AGE
+
+    runtime_path = BASE_DIRECTORY / "data" / "botsort_runtime.yaml"
+    runtime_path.parent.mkdir(parents=True, exist_ok=True)
+    runtime_path.write_text(
+        yaml.safe_dump(payload, sort_keys=False),
+        encoding="utf-8",
+    )
+    return str(runtime_path)
 
 app = Flask(__name__)
 frame_lock = threading.Lock()
@@ -281,7 +328,7 @@ threading.Thread(target=run_event_sender, daemon=True, name="vision-events").sta
 
 
 class FaceRecognitionService:
-    """Runs DeepFace on one background thread and binds identities to tracks."""
+    """Runs InsightFace on one background thread and binds identities to tracks."""
 
     def __init__(self, registry: FaceRegistry, enabled: bool) -> None:
         self.registry = registry
@@ -295,6 +342,8 @@ class FaceRecognitionService:
         self.latest_embeddings: dict[str, list[float]] = {}
         self.identities: dict[str, dict] = {}
         self.active_tracks: set[str] = set()
+        self.track_staleness: dict[str, int] = {}
+        self.superseded_tracks: set[str] = set()
         self.candidate_history: dict[str, deque[Optional[FaceMatch]]] = defaultdict(
             lambda: deque(
                 maxlen=max(
@@ -318,6 +367,7 @@ class FaceRecognitionService:
         self.best_candidates: dict[str, dict] = {}
         self.last_face_sample_at: dict[str, str] = {}
         self.last_failure_log: dict[str, float] = {}
+        self.execution_providers: list[str] = []
 
     def start(self) -> None:
         if self.enabled:
@@ -330,9 +380,12 @@ class FaceRecognitionService:
 
     def _run(self) -> None:
         try:
-            encoder = DeepFaceEncoder(
+            encoder = InsightFaceEncoder(
                 model_name=FACE_MODEL_NAME,
-                detector_backend=FACE_DETECTOR_BACKEND,
+                providers=FACE_EXECUTION_PROVIDERS,
+                model_root=FACE_MODEL_ROOT,
+                detection_size=FACE_DETECTION_SIZE,
+                require_accelerator=FACE_REQUIRE_GPU,
                 min_face_size=FACE_MIN_FACE_SIZE,
                 min_detection_confidence=FACE_MIN_DETECTION_CONFIDENCE,
                 min_blur_variance=FACE_MIN_BLUR_VARIANCE,
@@ -349,9 +402,14 @@ class FaceRecognitionService:
 
         with self.lock:
             self.worker_status = "ready"
+            self.execution_providers = list(encoder.providers)
         print(
             "face recognition ready:",
-            {"model": FACE_MODEL_NAME, "detector": FACE_DETECTOR_BACKEND},
+            {
+                "model": FACE_MODEL_NAME,
+                "detector": FACE_DETECTOR_BACKEND,
+                "providers": encoder.providers,
+            },
         )
 
         while True:
@@ -454,8 +512,55 @@ class FaceRecognitionService:
                     "distance": round(vote.distance, 4),
                     "threshold": vote.threshold,
                 }
-                self.identities[track_id] = identity
-                event_to_send = ("person_recognized", identity.copy())
+                identity_owners = [
+                    owner_track_id
+                    for owner_track_id, owner_identity in self.identities.items()
+                    if (
+                        owner_track_id != track_id
+                        and owner_track_id in self.active_tracks
+                        and owner_track_id not in self.superseded_tracks
+                        and owner_identity.get("status") == "recognized"
+                        and owner_identity.get("person_id") == vote.person_id
+                    )
+                ]
+                duplicate_resolution = resolve_duplicate_identity_track(
+                    candidate_track_id=track_id,
+                    existing_tracks=(
+                        (
+                            owner_track_id,
+                            self.track_staleness.get(owner_track_id, 0),
+                        )
+                        for owner_track_id in identity_owners
+                    ),
+                )
+
+                if duplicate_resolution is None:
+                    self.identities[track_id] = identity
+                    event_to_send = ("person_recognized", identity.copy())
+                elif duplicate_resolution[0] != track_id:
+                    # Both boxes are current detections. Keep the identity owner
+                    # that was already visible and retire the duplicate track.
+                    owner_track_id = duplicate_resolution[0]
+                    self.identities[track_id] = identity
+                    self.superseded_tracks.add(track_id)
+                    print(
+                        f"duplicate face track suppressed: {vote.name} "
+                        f"kept={owner_track_id}, dropped={track_id}"
+                    )
+                else:
+                    # The old owner is only a Kalman prediction. Move the
+                    # logical person to the fresh track without emitting a
+                    # disappearance/reappearance pair.
+                    owner_track_id = duplicate_resolution[1]
+                    self.identities[track_id] = identity
+                    self.superseded_tracks.add(owner_track_id)
+                    if owner_track_id in self.identity_event_tracks:
+                        self.identity_event_tracks.discard(owner_track_id)
+                        self.identity_event_tracks.add(track_id)
+                    print(
+                        f"face identity track transferred: {vote.name} "
+                        f"old={owner_track_id}, new={track_id}"
+                    )
 
             if event_to_send is None:
                 required = max(1, FACE_UNKNOWN_CONFIRMATIONS)
@@ -520,9 +625,18 @@ class FaceRecognitionService:
             except (Empty, Full):
                 return False
 
-    def mark_active(self, track_id: str) -> None:
+    def mark_active(self, track_id: str, time_since_update: int = 0) -> None:
         with self.lock:
             self.active_tracks.add(track_id)
+            self.track_staleness[track_id] = max(0, int(time_since_update))
+
+    def is_superseded(self, track_id: str) -> bool:
+        with self.lock:
+            return track_id in self.superseded_tracks
+
+    def prune_superseded_tracks(self, tracker_track_ids: set[str]) -> None:
+        with self.lock:
+            self.superseded_tracks.intersection_update(tracker_track_ids)
 
     def identity_for(self, track_id: str) -> dict:
         with self.lock:
@@ -689,6 +803,7 @@ class FaceRecognitionService:
     def forget_track(self, track_id: str) -> None:
         with self.sample_condition:
             self.active_tracks.discard(track_id)
+            self.track_staleness.pop(track_id, None)
             self.last_submitted.pop(track_id, None)
             self.latest_embeddings.pop(track_id, None)
             self.identities.pop(track_id, None)
@@ -763,8 +878,11 @@ class FaceRecognitionService:
                 "error": self.worker_error,
                 "model": FACE_MODEL_NAME,
                 "detector": FACE_DETECTOR_BACKEND,
+                "execution_providers": list(self.execution_providers),
+                "gpu_required": FACE_REQUIRE_GPU,
                 "registered_people": len(self.registry.list_people()),
                 "active_enrollments": len(self.enrollment_sessions),
+                "suppressed_duplicate_tracks": len(self.superseded_tracks),
                 "quality_filter": {
                     "min_face_size": FACE_MIN_FACE_SIZE,
                     "min_detection_confidence": FACE_MIN_DETECTION_CONFIDENCE,
@@ -774,6 +892,7 @@ class FaceRecognitionService:
                         FACE_MAX_BRIGHTNESS,
                     ],
                     "max_input_dimension": FACE_INPUT_MAX_DIMENSION,
+                    "detection_size": FACE_DETECTION_SIZE,
                 },
                 "enrollment": {
                     "maximum_seconds": FACE_ENROLLMENT_SECONDS,
@@ -969,11 +1088,12 @@ person_class_ids = [
     for class_id, class_name in model.names.items()
     if class_name == "person"
 ]
-tracker = DeepSort(max_age=30)
+effective_tracker_config_path = prepare_tracker_config()
 face_service.start()
 cap = cv2.VideoCapture(CAMERA_INDEX)
 prev_active_ids: set[str] = set()
 track_positions: dict[str, str] = {}
+track_lifecycle = TrackLifecycle(max_missing_frames=TRACK_MAX_AGE)
 
 
 def clamp_bbox(bounds, frame_shape) -> tuple[int, int, int, int]:
@@ -1014,18 +1134,20 @@ try:
             break
 
         raw_snapshot = frame.copy()
-        results = model(
+        result = model.track(
             frame,
+            persist=True,
+            tracker=effective_tracker_config_path,
             verbose=False,
             classes=person_class_ids or None,
-            conf=YOLO_CONFIDENCE_THRESHOLD,
+            conf=YOLO_TRACK_CONFIDENCE_THRESHOLD,
         )[0]
-        detections = []
+        observed_ids: set[str] = set()
 
-        for box in results.boxes:
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            confidence = float(box.conf[0])
-            class_id = int(box.cls[0])
+        for observation in observations_from_result(result):
+            x1, y1, x2, y2 = observation.bounds
+            confidence = observation.confidence
+            class_id = observation.class_id
             label = model.names[class_id]
             if label != "person":
                 continue
@@ -1037,37 +1159,25 @@ try:
                 confidence=confidence,
                 frame_width=frame.shape[1],
                 frame_height=frame.shape[0],
-                minimum_confidence=YOLO_CONFIDENCE_THRESHOLD,
+                minimum_confidence=YOLO_TRACK_CONFIDENCE_THRESHOLD,
                 minimum_width=YOLO_MIN_PERSON_WIDTH,
                 minimum_height=YOLO_MIN_PERSON_HEIGHT,
                 minimum_area_ratio=YOLO_MIN_PERSON_AREA_RATIO,
             ):
                 continue
-            detections.append(
-                ([x1, y1, width, height], confidence, label)
-            )
-
-        tracks = tracker.update_tracks(detections, frame=frame)
-        current_active_ids: set[str] = set()
-
-        for track in tracks:
-            if not track.is_confirmed():
+            track_id = observation.track_id
+            observed_ids.add(track_id)
+            if face_service.is_superseded(track_id):
                 continue
 
-            track_id = str(track.track_id)
-            current_active_ids.add(track_id)
-            face_service.mark_active(track_id)
-            bounds = track.to_ltrb(orig=True, orig_strict=False)
-            if bounds is None:
-                continue
-            left, top, right, bottom = clamp_bbox(bounds, frame.shape)
+            face_service.mark_active(track_id, 0)
+            left, top, right, bottom = clamp_bbox(observation.bounds, frame.shape)
             position = horizontal_position(left, right, frame.shape[1])
             track_positions[track_id] = position
             identity = face_service.identity_for(track_id)
 
             if (
-                track.time_since_update == 0
-                and right - left >= FACE_MIN_PERSON_WIDTH
+                right - left >= FACE_MIN_PERSON_WIDTH
                 and bottom - top >= FACE_MIN_PERSON_HEIGHT
             ):
                 face_search_bottom = min(
@@ -1089,6 +1199,20 @@ try:
                 2,
             )
             cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+
+        tracker_active_ids, _ = track_lifecycle.update(observed_ids)
+        face_service.prune_superseded_tracks(tracker_active_ids)
+        for stale_id in tracker_active_ids - observed_ids:
+            if not face_service.is_superseded(stale_id):
+                face_service.mark_active(
+                    stale_id,
+                    track_lifecycle.staleness(stale_id),
+                )
+        current_active_ids = {
+            track_id
+            for track_id in tracker_active_ids
+            if not face_service.is_superseded(track_id)
+        }
 
         for disappeared_id in prev_active_ids - current_active_ids:
             if face_service.identity_event_announced(disappeared_id):
@@ -1121,7 +1245,7 @@ try:
                 event_color,
                 2,
             )
-            cv2.imshow("DeepSORT", frame)
+            cv2.imshow("Embodied Vision - BoT-SORT + InsightFace", frame)
             pressed_key = cv2.waitKey(1) & 0xFF
             if pressed_key == 27:
                 break

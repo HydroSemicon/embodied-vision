@@ -10,7 +10,11 @@ from face_registry import (
     resolve_face_vote,
     select_representative_encodings,
 )
-from vision_filters import is_plausible_person_detection
+from vision_filters import (
+    is_plausible_person_detection,
+    resolve_duplicate_identity_track,
+)
+from vision_tracking import TrackLifecycle, observations_from_result
 
 
 class FaceRegistryTests(unittest.TestCase):
@@ -172,6 +176,64 @@ class FaceRegistryTests(unittest.TestCase):
             minimum_area_ratio=0.002,
         )
         self.assertTrue(accepted)
+
+    def test_current_identity_owner_beats_duplicate_track(self):
+        resolution = resolve_duplicate_identity_track(
+            candidate_track_id="20",
+            existing_tracks=[("18", 0)],
+        )
+        self.assertEqual(resolution, ("18", "20"))
+
+    def test_fresh_track_replaces_stale_identity_owner(self):
+        resolution = resolve_duplicate_identity_track(
+            candidate_track_id="20",
+            existing_tracks=[("18", 3)],
+        )
+        self.assertEqual(resolution, ("20", "18"))
+
+    def test_track_lifecycle_bridges_short_occlusion(self):
+        lifecycle = TrackLifecycle(max_missing_frames=2)
+        active, disappeared = lifecycle.update(["7"])
+        self.assertEqual(active, {"7"})
+        self.assertEqual(disappeared, set())
+
+        active, disappeared = lifecycle.update([])
+        self.assertEqual(active, {"7"})
+        self.assertEqual(lifecycle.staleness("7"), 1)
+        self.assertEqual(disappeared, set())
+
+        lifecycle.update([])
+        active, disappeared = lifecycle.update([])
+        self.assertEqual(active, set())
+        self.assertEqual(disappeared, {"7"})
+
+    def test_ultralytics_track_result_is_converted_to_plain_observation(self):
+        class FakeTensor:
+            def __init__(self, value):
+                self.value = value
+
+            def detach(self):
+                return self
+
+            def cpu(self):
+                return self
+
+            def tolist(self):
+                return self.value
+
+        class FakeBoxes:
+            is_track = True
+            id = FakeTensor([14.0])
+            xyxy = FakeTensor([[10.0, 20.0, 110.0, 220.0]])
+            conf = FakeTensor([0.91])
+            cls = FakeTensor([0.0])
+
+        result = type("Result", (), {"boxes": FakeBoxes()})()
+        observations = observations_from_result(result)
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].track_id, "14")
+        self.assertEqual(observations[0].bounds, (10.0, 20.0, 110.0, 220.0))
+        self.assertAlmostEqual(observations[0].confidence, 0.91)
 
 
 if __name__ == "__main__":
