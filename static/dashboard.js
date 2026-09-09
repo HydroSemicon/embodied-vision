@@ -157,15 +157,14 @@ function renderTracks(tracks) {
 
 function updateEnrollAvailability() {
   const track = currentTracks.find((item) => String(item.track_id) === elements.trackSelect.value);
-  const ready = Boolean(track?.face_sample_ready);
-  elements.enrollButton.disabled = !ready || enrollmentRequestActive || Boolean(track?.enrollment);
+  elements.enrollButton.disabled = !track || enrollmentRequestActive || Boolean(track?.enrollment);
   elements.enrollHint.textContent = !track
     ? "人物が検出されると選択できます。"
     : track.enrollment
       ? `${track.enrollment.name} の登録中です。正面からゆっくり左右へ顔を向けてください。`
     : ready
       ? "開始後、最大30秒間収集します。正面からゆっくり左右へ顔を向けてください。"
-      : `track #${track.track_id} は顔サンプルの取得待ちです。正面を向いてください。`;
+      : `track #${track.track_id} の登録を開始できます。開始後、正面からゆっくり左右へ顔を向けてください。`;
 }
 
 function trackSignature(track) {
@@ -251,7 +250,11 @@ async function refreshStatus() {
     }
     const face = status.face_recognition || {};
     elements.recognitionState.textContent = face.state === "ready" ? "稼働中" : statusLabel(face.state);
-    elements.modelState.textContent = face.model ? `${face.model} / ${face.detector}` : "--";
+    elements.recognitionState.title = face.error || "";
+    const provider = Array.isArray(face.execution_providers) ? face.execution_providers[0] : null;
+    elements.modelState.textContent = face.model
+      ? `${face.model} / ${face.detector}${provider ? ` / ${provider.replace("ExecutionProvider", "")}` : ""}`
+      : "--";
     elements.peopleCount.textContent = String(face.registered_people ?? 0);
     setEventSwitch(status.face_events?.effective_enabled ?? status.event_delivery);
     elements.lastUpdated.textContent = new Date().toLocaleTimeString("ja-JP");

@@ -7,4 +7,5 @@ data/face_registry.json
 data/face_registry.json.tmp
 data/face_registry_*.json
 data/face_registry_*.json.tmp
+data/botsort_runtime.yaml
 __pycache__/

@@ -1,4 +1,4 @@
-"""Persistent face embeddings and a small DeepFace adapter.
+"""Persistent face embeddings and an InsightFace adapter.
 
 The registry deliberately stores embeddings only. Camera frames and face crops stay
 in memory and are never written to disk by this module.
@@ -395,33 +395,107 @@ class FaceRegistry:
             }
 
 
-class DeepFaceEncoder:
-    """Lazy DeepFace wrapper so tracking can still run when DeepFace is unavailable."""
+class InsightFaceEncoder:
+    """Lazy InsightFace wrapper with explicit quality gates.
+
+    ``analysis_app`` exists for deterministic unit tests. Production creates a
+    ``FaceAnalysis`` pipeline, which performs SCRFD detection, alignment and
+    buffalo-family recognition in one pass.
+    """
 
     def __init__(
         self,
         *,
         model_name: str,
-        detector_backend: str,
+        providers: Optional[Iterable[str]] = None,
+        model_root: Optional[str] = None,
+        detection_size: int = 640,
+        require_accelerator: bool = False,
         min_face_size: int = 70,
         min_detection_confidence: float = 0.90,
         min_blur_variance: float = 35.0,
         min_brightness: float = 35.0,
         max_brightness: float = 225.0,
         max_input_dimension: int = 640,
+        analysis_app=None,
     ) -> None:
-        from deepface import DeepFace  # type: ignore
-
-        self._deepface = DeepFace
         self.model_name = model_name
-        self.detector_backend = detector_backend
+        self.detector_backend = "SCRFD"
         self.min_face_size = min_face_size
         self.min_detection_confidence = min_detection_confidence
         self.min_blur_variance = min_blur_variance
         self.min_brightness = min_brightness
         self.max_brightness = max_brightness
         self.max_input_dimension = max_input_dimension
-        self._deepface.build_model(model_name=model_name)
+        self.detection_size = max(128, int(detection_size))
+
+        if analysis_app is not None:
+            self._analysis = analysis_app
+            self.providers = ["test"]
+            return
+
+        import onnxruntime as ort  # type: ignore
+        from insightface.app import FaceAnalysis  # type: ignore
+
+        available = ort.get_available_providers()
+        requested = list(providers or ("CUDAExecutionProvider", "CPUExecutionProvider"))
+        selected = [provider for provider in requested if provider in available]
+        if not selected:
+            selected = list(available)
+        accelerators = {
+            "CUDAExecutionProvider",
+            "TensorrtExecutionProvider",
+        }
+        if require_accelerator and not accelerators.intersection(selected):
+            raise RuntimeError(
+                "GPU face recognition is required, but ONNX Runtime exposes only "
+                f"{available}. Remove the CPU 'onnxruntime' package and install a "
+                "CUDA/JetPack-compatible 'onnxruntime-gpu' build, or set "
+                "FACE_REQUIRE_GPU=false to allow CPU fallback."
+            )
+        if not selected:
+            raise RuntimeError("ONNX Runtime has no available execution provider")
+
+        options = {
+            "name": model_name,
+            "providers": selected,
+            "allowed_modules": ["detection", "recognition"],
+        }
+        if model_root:
+            options["root"] = model_root
+        self._analysis = FaceAnalysis(**options)
+        self._analysis.prepare(
+            ctx_id=(
+                0
+                if accelerators.intersection(selected)
+                else -1
+            ),
+            det_size=(self.detection_size, self.detection_size),
+            det_thresh=self.min_detection_confidence,
+        )
+        actual_providers: list[str] = []
+        for model in self._analysis.models.values():
+            session = getattr(model, "session", None)
+            if session is None or not hasattr(session, "get_providers"):
+                continue
+            for provider in session.get_providers():
+                if provider not in actual_providers:
+                    actual_providers.append(provider)
+        self.providers = actual_providers or selected
+        if require_accelerator and not accelerators.intersection(self.providers):
+            raise RuntimeError(
+                "InsightFace sessions fell back to CPU even though GPU was "
+                f"requested; active providers are {self.providers}. Check CUDA, "
+                "cuDNN and ONNX Runtime GPU compatibility."
+            )
+
+    @staticmethod
+    def _face_value(face, name: str, default=None):
+        if hasattr(face, name):
+            return getattr(face, name)
+        if isinstance(face, dict):
+            return face.get(name, default)
+        return default
 
     def encode(self, image) -> FaceEncoding:
         import cv2  # type: ignore
@@ -436,32 +510,37 @@ class DeepFaceEncoder:
                 interpolation=cv2.INTER_AREA,
             )
 
-        representations = self._deepface.represent(
-            img_path=image,
-            model_name=self.model_name,
-            detector_backend=self.detector_backend,
-            enforce_detection=True,
-            align=True,
-            max_faces=1,
-        )
-        if not representations:
+        faces = self._analysis.get(image)
+        if not faces:
             raise ValueError("no face detected")
 
-        largest = max(
-            representations,
-            key=lambda item: float(item.get("face_confidence") or 0.0)
-            * item.get("facial_area", {}).get("w", 0)
-            * item.get("facial_area", {}).get("h", 0),
+        selected_face = max(
+            faces,
+            key=lambda face: (
+                float(self._face_value(face, "det_score", 0.0) or 0.0)
+                * max(
+                    0.0,
+                    float(self._face_value(face, "bbox", [0, 0, 0, 0])[2])
+                    - float(self._face_value(face, "bbox", [0, 0, 0, 0])[0]),
+                )
+                * max(
+                    0.0,
+                    float(self._face_value(face, "bbox", [0, 0, 0, 0])[3])
+                    - float(self._face_value(face, "bbox", [0, 0, 0, 0])[1]),
+                )
+            ),
         )
-        area = largest.get("facial_area", {})
+        bbox = self._face_value(selected_face, "bbox")
+        if bbox is None or len(bbox) < 4:
+            raise ValueError("face detector returned no bounding box")
         image_height, image_width = image.shape[:2]
-        left = max(0, min(image_width, int(area.get("x", 0))))
-        top = max(0, min(image_height, int(area.get("y", 0))))
-        right = max(left, min(image_width, left + int(area.get("w", 0))))
-        bottom = max(top, min(image_height, top + int(area.get("h", 0))))
+        left = max(0, min(image_width, int(round(float(bbox[0])))))
+        top = max(0, min(image_height, int(round(float(bbox[1])))))
+        right = max(left, min(image_width, int(round(float(bbox[2])))))
+        bottom = max(top, min(image_height, int(round(float(bbox[3])))))
         face_width = right - left
         face_height = bottom - top
-        confidence = float(largest.get("face_confidence") or 0.0)
+        confidence = float(self._face_value(selected_face, "det_score", 0.0) or 0.0)
 
         if min(face_width, face_height) < self.min_face_size:
             raise ValueError(
@@ -500,8 +579,13 @@ class DeepFaceEncoder:
             + sharpness_score * 0.20
             + exposure_score * 0.10
         )
+        embedding = self._face_value(selected_face, "normed_embedding")
+        if embedding is None:
+            embedding = self._face_value(selected_face, "embedding")
+        if embedding is None:
+            raise ValueError("face recognizer returned no embedding")
         return FaceEncoding(
-            embedding=tuple(_normalise_embedding(largest["embedding"])),
+            embedding=tuple(_normalise_embedding(embedding)),
             detection_confidence=confidence,
             face_width=face_width,
             face_height=face_height,

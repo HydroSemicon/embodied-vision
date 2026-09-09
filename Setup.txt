@@ -17,12 +17,14 @@ pip install ultralytics opencv-python ipython pillow
 pip freeze > requirements.txt
 
 
-DeepSORT（3.11）
+BoT-SORT + InsightFace（3.11）
 echo deepsort-py311/ >> .gitignore
 py -3.11 -m venv deepsort-py311
 deepsort-py311\Scripts\activate
 pip install --upgrade pip "setuptools<81"
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-pip install ultralytics opencv-python Flask requests deep-sort-realtime
+pip install ultralytics opencv-python Flask requests PyYAML
 pip install -r face-recognition-requirements.txt
+pip uninstall -y onnxruntime onnxruntime-gpu
+pip install --no-cache-dir onnxruntime-gpu==1.20.2
 pip freeze > requirements.txt

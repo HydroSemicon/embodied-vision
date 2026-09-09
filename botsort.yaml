@@ -1,0 +1,18 @@
+# Accuracy-first BoT-SORT defaults. Detection thresholds and track_buffer are
+# overwritten at startup from environment variables.
+tracker_type: botsort
+track_high_thresh: 0.50
+track_low_thresh: 0.10
+new_track_thresh: 0.50
+track_buffer: 90
+match_thresh: 0.80
+fuse_score: true
+
+# The robot camera can move, so compensate for camera motion.
+gmc_method: sparseOptFlow
+
+# Use YOLO backbone appearance features in addition to position and motion.
+proximity_thresh: 0.50
+appearance_thresh: 0.80
+with_reid: true
+model: auto
