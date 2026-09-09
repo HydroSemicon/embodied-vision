@@ -5,7 +5,7 @@ YOLO + DeepSORTによる人物追跡と、DeepFaceによる登録人物照合を
 ## 動作
 
 - YOLOで検出した人物をDeepSORTの`track_id`で追跡します。
-- `person_appeared`、`person_disappeared`を`kokomi_kernel`へ送ります。
+- 人物を登録人物または未登録人物として確定したときだけ、`kokomi_kernel`へ通知します。
 - 顔照合は追跡ループとは別のワーカースレッドで実行します。
 - RetinaFaceで検出・位置合わせし、小さすぎる顔、ぼけ、露出不良を除外します。
 - Facenet512の複数フレーム投票で人物を確定し、単発の誤判定を抑えます。
@@ -81,8 +81,6 @@ Aliceや`kokomi_kernel`を起動しなくても、以下を確認・操作でき
 | `FACE_ENROLLMENT_EXEMPLARS` | `8` | 1回の登録で選ぶ代表特徴量数 |
 | `FACE_MAX_EMBEDDINGS_PER_PERSON` | `12` | 1人あたりの最大保存特徴量数 |
 | `FACE_REGISTRY_PATH` | `data/face_registry_facenet512.json` | 登録データ保存先 |
-| `TRACK_EVENT_STABILITY_SECONDS` | `1.5` | 顔未取得時の出現通知待ち時間 |
-| `TRACK_IDENTITY_WAIT_SECONDS` | `6.0` | 顔取得後に照合結果を待つ上限 |
 
 ## HTTP API
 
@@ -133,11 +131,10 @@ Content-Type: application/json
 
 | `type` | 送信条件 | 追加情報 |
 |---|---|---|
-| `person_appeared` | 人物トラックが安定して存在 | `position`に`left`、`center`、`right`のいずれかを設定 |
 | `person_recognized` | 登録人物との照合が確定 | 同一人物の2回連続一致、または通常の複数票で確定 |
 | `person_unknown` | 15秒以上観測し、高品質な不一致が40件連続 | 一時的な顔検出失敗だけでは送信しない |
 | `person_enrolled` | 顔登録がバックグラウンドで完了 | 登録直後なので`identity.distance`は`0.0` |
-| `person_disappeared` | 通知済みの人物トラックが消失 | 最後の`identity`と`position`を設定 |
+| `person_disappeared` | `person_recognized`、`person_unknown`または`person_enrolled`を通知済みの人物トラックが消失 | 最後の`identity`と`position`を設定 |
 
 `identity`は常に以下の5フィールドを持ちます。
 
@@ -151,23 +148,23 @@ Content-Type: application/json
 
 ### 通常の送信順序
 
-登録人物を約6秒以内に照合できた場合、冗長な`person_appeared`は送らず、直接`person_recognized`を送ります。
+人物を検出しただけではイベントを送りません。登録人物または未登録人物として確定してから通知します。顔を取得できない人物や、YOLOが一時的に誤検出した黄色枠からはイベントを送りません。
 
 ```text
 人物出現
-  ├─ 約6秒以内に照合成功
-  │    person_recognized → person_disappeared
+  ├─ 登録人物との照合成功
+  │    person_recognized
+  │    → その人物が離れたら person_disappeared
   │
-  ├─ 顔サンプルを取得できない
-  │    1.5秒後 person_appeared(pending) → person_disappeared
+  ├─ 顔を取得できない・人物候補が短時間で消える
+  │    イベントなし
   │
   └─ 顔は取得できるが未登録
-       6秒後 person_appeared(pending)
-       → 15秒以上かつ不一致40件後 person_unknown
-       → person_disappeared
+       15秒以上かつ不一致40件後 person_unknown
+       → その人物が離れたら person_disappeared
 ```
 
-`person_appeared`送信後に照合が確定した場合は、続けて`person_recognized`または`person_unknown`を送ります。登録セッション中は`person_unknown`を抑制し、登録成功後に`person_enrolled`を送ります。
+`person_appeared`は送信しません。登録セッション中は`person_unknown`を抑制し、登録成功後に`person_enrolled`を送ります。`person_disappeared`も、認識結果または登録完了を一度も通知していないトラックについては送信しません。
 
 ### 配信とイベントスイッチ
 

@@ -117,8 +117,6 @@ FACE_ENROLLMENT_CLUSTER_DISTANCE = float(
 FACE_MAX_EMBEDDINGS_PER_PERSON = int(
     os.getenv("FACE_MAX_EMBEDDINGS_PER_PERSON", "12")
 )
-TRACK_EVENT_STABILITY_SECONDS = float(os.getenv("TRACK_EVENT_STABILITY_SECONDS", "1.5"))
-TRACK_IDENTITY_WAIT_SECONDS = float(os.getenv("TRACK_IDENTITY_WAIT_SECONDS", "6.0"))
 UI_STREAM_FPS = max(1.0, min(120.0, float(os.getenv("VISION_UI_STREAM_FPS", "30"))))
 UI_JPEG_QUALITY = max(50, min(100, int(os.getenv("VISION_UI_JPEG_QUALITY", "90"))))
 DEFAULT_FACE_REGISTRY_PATH = (
@@ -192,7 +190,6 @@ def pending_identity(status: str = "pending") -> dict:
 def event_message(event_type: str, identity: dict) -> str:
     name = identity.get("name")
     messages = {
-        "person_appeared": "A person has appeared. Identity recognition is in progress.",
         "person_unknown": "A visible face is not registered.",
         "person_disappeared": "A tracked person has disappeared.",
         "person_enrolled": f"The visible person was registered as {name}.",
@@ -536,10 +533,6 @@ class FaceRecognitionService:
                 return pending_identity("unavailable")
             return pending_identity()
 
-    def has_face_sample(self, track_id: str) -> bool:
-        with self.lock:
-            return track_id in self.latest_embeddings
-
     def identity_event_announced(self, track_id: str) -> bool:
         with self.lock:
             return track_id in self.identity_event_tracks
@@ -713,10 +706,6 @@ class FaceRecognitionService:
             self.last_face_sample_at.pop(track_id, None)
             self.last_failure_log.pop(track_id, None)
             self.sample_condition.notify_all()
-
-    def enrollment_active(self, track_id: str) -> bool:
-        with self.lock:
-            return track_id in self.enrollment_sessions
 
     def track_states(self) -> list[dict]:
         now = time.monotonic()
@@ -985,8 +974,6 @@ face_service.start()
 cap = cv2.VideoCapture(CAMERA_INDEX)
 prev_active_ids: set[str] = set()
 track_positions: dict[str, str] = {}
-track_first_seen: dict[str, float] = {}
-announced_presence_ids: set[str] = set()
 
 
 def clamp_bbox(bounds, frame_shape) -> tuple[int, int, int, int]:
@@ -1103,42 +1090,8 @@ try:
             )
             cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
 
-        now = time.monotonic()
-        for appeared_id in current_active_ids - prev_active_ids:
-            track_first_seen[appeared_id] = now
-
-        for active_id in current_active_ids:
-            if active_id in announced_presence_ids:
-                continue
-            if face_service.identity_event_announced(active_id):
-                continue
-            if face_service.enrollment_active(active_id):
-                continue
-
-            visible_seconds = now - track_first_seen.get(active_id, now)
-            waiting_for_identity = face_service.has_face_sample(active_id)
-            announce_after = (
-                TRACK_IDENTITY_WAIT_SECONDS
-                if waiting_for_identity
-                else TRACK_EVENT_STABILITY_SECONDS
-            )
-            if visible_seconds < announce_after:
-                continue
-
-            queued = send_person_event(
-                "person_appeared",
-                active_id,
-                position=track_positions.get(active_id),
-                identity=face_service.identity_for(active_id),
-            )
-            if queued:
-                announced_presence_ids.add(active_id)
-
         for disappeared_id in prev_active_ids - current_active_ids:
-            if (
-                disappeared_id in announced_presence_ids
-                or face_service.identity_event_announced(disappeared_id)
-            ):
+            if face_service.identity_event_announced(disappeared_id):
                 send_person_event(
                     "person_disappeared",
                     disappeared_id,
@@ -1147,8 +1100,6 @@ try:
                 )
             face_service.forget_track(disappeared_id)
             track_positions.pop(disappeared_id, None)
-            track_first_seen.pop(disappeared_id, None)
-            announced_presence_ids.discard(disappeared_id)
 
         prev_active_ids = current_active_ids
 
