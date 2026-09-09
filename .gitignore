@@ -5,4 +5,6 @@ yolo-py311/
 deepsort-py311/ 
 data/face_registry.json
 data/face_registry.json.tmp
+data/face_registry_*.json
+data/face_registry_*.json.tmp
 __pycache__/

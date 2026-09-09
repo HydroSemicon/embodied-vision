@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Embodied Vision Console</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">LOCAL VISION RUNTIME</p>
+      <h1>Embodied Vision Console</h1>
+    </div>
+    <div class="connection" id="connectionStatus" aria-live="polite">
+      <span class="status-dot"></span>
+      <span>接続待ち</span>
+    </div>
+  </header>
+
+  <main class="dashboard">
+    <section class="panel camera-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="section-label">CAMERA</p>
+          <h2>リアルタイム映像</h2>
+        </div>
+        <div class="live-badge"><span></span> LIVE</div>
+      </div>
+      <div class="camera-stage">
+        <img id="cameraFeed" alt="DeepSORTの追跡結果付きカメラ映像">
+        <div class="camera-placeholder" id="cameraPlaceholder">
+          <div class="scanner"></div>
+          <strong>カメラ映像を待っています</strong>
+          <span>Pythonサービスの起動後、自動的に接続します</span>
+        </div>
+      </div>
+      <div class="camera-footer">
+        <span>緑: 登録人物</span>
+        <span>黄: 照合中・未登録</span>
+        <a href="/snapshot" target="_blank" rel="noreferrer">生画像を開く</a>
+      </div>
+    </section>
+
+    <aside class="side-column">
+      <section class="panel status-panel">
+        <div class="panel-heading compact">
+          <div>
+            <p class="section-label">SYSTEM</p>
+            <h2>動作状態</h2>
+          </div>
+          <span class="last-updated" id="lastUpdated">--:--:--</span>
+        </div>
+        <div class="status-grid">
+          <div class="metric">
+            <span>カメラ</span>
+            <strong id="cameraState">確認中</strong>
+          </div>
+          <div class="metric">
+            <span>顔認識</span>
+            <strong id="recognitionState">確認中</strong>
+          </div>
+          <div class="metric">
+            <span>モデル</span>
+            <strong id="modelState">--</strong>
+          </div>
+          <div class="metric">
+            <span>登録人数</span>
+            <strong id="peopleCount">0</strong>
+          </div>
+        </div>
+        <div class="event-switch-row">
+          <div>
+            <span class="field-label">Aliceへの顔・人物イベント</span>
+            <small>画像APIと認識処理には影響しません</small>
+          </div>
+          <button class="switch" id="eventSwitch" type="button" role="switch" aria-checked="false">
+            <span class="switch-knob"></span>
+            <span class="switch-label">OFF</span>
+          </button>
+        </div>
+      </section>
+
+      <section class="panel enroll-panel">
+        <div class="panel-heading compact">
+          <div>
+            <p class="section-label">ENROLL</p>
+            <h2>見えている顔を登録</h2>
+          </div>
+        </div>
+        <form id="enrollForm">
+          <label>
+            <span>追跡対象</span>
+            <select id="trackSelect" required>
+              <option value="">人物を待っています</option>
+            </select>
+          </label>
+          <label>
+            <span>名前</span>
+            <input id="personName" type="text" maxlength="80" autocomplete="off" placeholder="例: KOT" required>
+          </label>
+          <button class="primary-button" id="enrollButton" type="submit" disabled>この顔を登録</button>
+        </form>
+        <p class="form-hint" id="enrollHint">登録開始後、正面を見てから顔をゆっくり左右へ向けてください。</p>
+      </section>
+    </aside>
+
+    <section class="panel tracks-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="section-label">TRACKING</p>
+          <h2>現在見えている人物</h2>
+        </div>
+        <span class="count-badge" id="trackCount">0 tracks</span>
+      </div>
+      <div class="track-list" id="trackList">
+        <div class="empty-state">人物は検出されていません</div>
+      </div>
+    </section>
+
+    <section class="panel registry-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="section-label">FACE REGISTRY</p>
+          <h2>登録済みの人物</h2>
+        </div>
+        <button class="quiet-button" id="refreshRegistry" type="button">更新</button>
+      </div>
+      <div class="registry-list" id="registryList">
+        <div class="empty-state">登録データを読み込んでいます</div>
+      </div>
+    </section>
+
+    <section class="panel log-panel">
+      <div class="panel-heading compact">
+        <div>
+          <p class="section-label">ACTIVITY</p>
+          <h2>照合ログ</h2>
+        </div>
+        <button class="quiet-button" id="clearLog" type="button">消去</button>
+      </div>
+      <ol class="activity-log" id="activityLog">
+        <li class="muted">状態の変化がここに表示されます</li>
+      </ol>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="{{ url_for('static', filename='dashboard.js') }}" defer></script>
+</body>
+</html>

@@ -6,6 +6,7 @@ in memory and are never written to disk by this module.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -13,6 +14,7 @@ import math
 from pathlib import Path
 import threading
 import uuid
+from statistics import median
 from typing import Iterable, Optional
 
 
@@ -40,6 +42,176 @@ class FaceMatch:
     name: str
     distance: float
     threshold: float
+
+
+@dataclass(frozen=True)
+class FaceEncoding:
+    embedding: tuple[float, ...]
+    detection_confidence: float
+    face_width: int
+    face_height: int
+    blur_variance: float
+    brightness: float
+    quality: float
+
+    def public_quality(self) -> dict:
+        return {
+            "detection_confidence": round(self.detection_confidence, 4),
+            "face_width": self.face_width,
+            "face_height": self.face_height,
+            "blur_variance": round(self.blur_variance, 1),
+            "brightness": round(self.brightness, 1),
+            "quality": round(self.quality, 3),
+        }
+
+
+@dataclass(frozen=True)
+class FaceVote:
+    person_id: str
+    name: str
+    distance: float
+    threshold: float
+    votes: int
+    window: int
+
+
+def cosine_distance(left: Iterable[float], right: Iterable[float]) -> float:
+    left_normalised = _normalise_embedding(left)
+    right_normalised = _normalise_embedding(right)
+    if len(left_normalised) != len(right_normalised):
+        raise ValueError("embedding dimensions must match")
+    similarity = sum(
+        left_value * right_value
+        for left_value, right_value in zip(left_normalised, right_normalised)
+    )
+    return 1.0 - max(-1.0, min(1.0, similarity))
+
+
+def select_representative_encodings(
+    encodings: Iterable[FaceEncoding],
+    *,
+    limit: int,
+    cluster_distance: float,
+    duplicate_distance: float = 0.015,
+) -> list[FaceEncoding]:
+    """Remove isolated samples, then retain high-quality diverse exemplars."""
+    samples = list(encodings)
+    if not samples or limit < 1:
+        return []
+    if len(samples) == 1:
+        return samples
+
+    neighbours: list[set[int]] = [set() for _ in samples]
+    for left_index, left in enumerate(samples):
+        for right_index in range(left_index + 1, len(samples)):
+            distance = cosine_distance(
+                left.embedding,
+                samples[right_index].embedding,
+            )
+            if distance <= cluster_distance:
+                neighbours[left_index].add(right_index)
+                neighbours[right_index].add(left_index)
+
+    components: list[list[int]] = []
+    remaining = set(range(len(samples)))
+    while remaining:
+        seed = remaining.pop()
+        component = [seed]
+        pending = [seed]
+        while pending:
+            current = pending.pop()
+            connected = neighbours[current] & remaining
+            remaining.difference_update(connected)
+            component.extend(connected)
+            pending.extend(connected)
+        components.append(component)
+
+    component = max(
+        components,
+        key=lambda indexes: (
+            len(indexes),
+            sum(samples[index].quality for index in indexes) / len(indexes),
+        ),
+    )
+    candidates = [samples[index] for index in component]
+    first = max(candidates, key=lambda sample: sample.quality)
+    selected = [first]
+    candidates.remove(first)
+
+    while candidates and len(selected) < limit:
+        ranked = []
+        for candidate in candidates:
+            nearest_selected = min(
+                cosine_distance(candidate.embedding, item.embedding)
+                for item in selected
+            )
+            ranked.append(
+                (
+                    nearest_selected * 0.75 + candidate.quality * 0.25,
+                    nearest_selected,
+                    candidate,
+                )
+            )
+        _, nearest_selected, chosen = max(ranked, key=lambda item: item[0])
+        candidates.remove(chosen)
+        if nearest_selected >= duplicate_distance:
+            selected.append(chosen)
+
+    return selected
+
+
+def resolve_face_vote(
+    candidates: Iterable[Optional[FaceMatch]],
+    *,
+    window_size: int,
+    min_votes: int,
+    min_vote_ratio: float,
+    consecutive_matches: int = 0,
+) -> Optional[FaceVote]:
+    recent = list(candidates)[-max(1, window_size) :]
+    if not recent:
+        return None
+
+    consecutive_matches = max(0, consecutive_matches)
+    if consecutive_matches and len(recent) >= consecutive_matches:
+        tail = recent[-consecutive_matches:]
+        if tail[0] is not None and all(
+            candidate is not None and candidate.person_id == tail[0].person_id
+            for candidate in tail
+        ):
+            representative = min(tail, key=lambda candidate: candidate.distance)
+            return FaceVote(
+                person_id=representative.person_id,
+                name=representative.name,
+                distance=median(candidate.distance for candidate in tail),
+                threshold=representative.threshold,
+                votes=consecutive_matches,
+                window=consecutive_matches,
+            )
+
+    vote_counts = Counter(
+        candidate.person_id for candidate in recent if candidate is not None
+    )
+    if not vote_counts:
+        return None
+
+    winner_id, winner_votes = vote_counts.most_common(1)[0]
+    if winner_votes < max(1, min_votes) or winner_votes / len(recent) < min_vote_ratio:
+        return None
+    winner_matches = [
+        candidate
+        for candidate in recent
+        if candidate is not None and candidate.person_id == winner_id
+    ]
+    representative = min(winner_matches, key=lambda candidate: candidate.distance)
+    return FaceVote(
+        person_id=representative.person_id,
+        name=representative.name,
+        distance=median(candidate.distance for candidate in winner_matches),
+        threshold=representative.threshold,
+        votes=winner_votes,
+        window=len(recent),
+    )
 
 
 class FaceRegistry:
@@ -133,6 +305,13 @@ class FaceRegistry:
             ]
 
     def match(self, embedding: Iterable[float]) -> Optional[FaceMatch]:
+        best = self.nearest(embedding)
+        if best is None or best.distance > self.threshold:
+            return None
+        return best
+
+    def nearest(self, embedding: Iterable[float]) -> Optional[FaceMatch]:
+        """Return the nearest registered face even when it exceeds the threshold."""
         candidate = _normalise_embedding(embedding)
         best: Optional[FaceMatch] = None
 
@@ -153,16 +332,25 @@ class FaceRegistry:
                             threshold=self.threshold,
                         )
 
-        if best is None or best.distance > self.threshold:
-            return None
         return best
 
     def enroll(self, name: str, embedding: Iterable[float]) -> dict:
+        return self.enroll_many(name, [embedding])
+
+    def enroll_many(
+        self,
+        name: str,
+        embeddings: Iterable[Iterable[float]],
+    ) -> dict:
         clean_name = name.strip()
         if not clean_name:
             raise ValueError("name must not be empty")
 
-        normalised = _normalise_embedding(embedding)
+        normalised_embeddings = [
+            _normalise_embedding(embedding) for embedding in embeddings
+        ]
+        if not normalised_embeddings:
+            raise ValueError("at least one embedding is required")
         now = _utc_now()
 
         with self._lock:
@@ -187,7 +375,15 @@ class FaceRegistry:
 
             person["name"] = clean_name
             person["updated_at"] = now
-            person["embeddings"].append(normalised)
+            added_count = 0
+            for normalised in normalised_embeddings:
+                if any(
+                    cosine_distance(normalised, existing) < 0.015
+                    for existing in person["embeddings"]
+                ):
+                    continue
+                person["embeddings"].append(normalised)
+                added_count += 1
             person["embeddings"] = person["embeddings"][-self.max_embeddings_per_person :]
             self._save_locked()
 
@@ -195,37 +391,121 @@ class FaceRegistry:
                 "person_id": person["person_id"],
                 "name": person["name"],
                 "embedding_count": len(person["embeddings"]),
+                "added_embedding_count": added_count,
             }
 
 
 class DeepFaceEncoder:
     """Lazy DeepFace wrapper so tracking can still run when DeepFace is unavailable."""
 
-    def __init__(self, *, model_name: str, detector_backend: str) -> None:
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        detector_backend: str,
+        min_face_size: int = 70,
+        min_detection_confidence: float = 0.90,
+        min_blur_variance: float = 35.0,
+        min_brightness: float = 35.0,
+        max_brightness: float = 225.0,
+        max_input_dimension: int = 640,
+    ) -> None:
         from deepface import DeepFace  # type: ignore
 
         self._deepface = DeepFace
         self.model_name = model_name
         self.detector_backend = detector_backend
+        self.min_face_size = min_face_size
+        self.min_detection_confidence = min_detection_confidence
+        self.min_blur_variance = min_blur_variance
+        self.min_brightness = min_brightness
+        self.max_brightness = max_brightness
+        self.max_input_dimension = max_input_dimension
         self._deepface.build_model(model_name=model_name)
 
-    def encode(self, image) -> list[float]:
+    def encode(self, image) -> FaceEncoding:
+        import cv2  # type: ignore
+
+        image_height, image_width = image.shape[:2]
+        longest_edge = max(image_width, image_height)
+        if self.max_input_dimension > 0 and longest_edge > self.max_input_dimension:
+            scale = self.max_input_dimension / longest_edge
+            image = cv2.resize(
+                image,
+                (max(1, round(image_width * scale)), max(1, round(image_height * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+
         representations = self._deepface.represent(
             img_path=image,
             model_name=self.model_name,
             detector_backend=self.detector_backend,
             enforce_detection=True,
             align=True,
-            max_faces=None,
+            max_faces=1,
         )
         if not representations:
             raise ValueError("no face detected")
 
         largest = max(
             representations,
-            key=lambda item: (
-                item.get("facial_area", {}).get("w", 0)
-                * item.get("facial_area", {}).get("h", 0)
-            ),
+            key=lambda item: float(item.get("face_confidence") or 0.0)
+            * item.get("facial_area", {}).get("w", 0)
+            * item.get("facial_area", {}).get("h", 0),
         )
-        return _normalise_embedding(largest["embedding"])
+        area = largest.get("facial_area", {})
+        image_height, image_width = image.shape[:2]
+        left = max(0, min(image_width, int(area.get("x", 0))))
+        top = max(0, min(image_height, int(area.get("y", 0))))
+        right = max(left, min(image_width, left + int(area.get("w", 0))))
+        bottom = max(top, min(image_height, top + int(area.get("h", 0))))
+        face_width = right - left
+        face_height = bottom - top
+        confidence = float(largest.get("face_confidence") or 0.0)
+
+        if min(face_width, face_height) < self.min_face_size:
+            raise ValueError(
+                f"face too small: {face_width}x{face_height}, "
+                f"minimum={self.min_face_size}"
+            )
+        if confidence < self.min_detection_confidence:
+            raise ValueError(
+                f"face confidence too low: {confidence:.3f}, "
+                f"minimum={self.min_detection_confidence:.3f}"
+            )
+
+        face_crop = image[top:bottom, left:right]
+        if not face_crop.size:
+            raise ValueError("detected face crop is empty")
+        gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+        blur_variance = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        brightness = float(gray.mean())
+        if blur_variance < self.min_blur_variance:
+            raise ValueError(
+                f"face too blurry: {blur_variance:.1f}, "
+                f"minimum={self.min_blur_variance:.1f}"
+            )
+        if not self.min_brightness <= brightness <= self.max_brightness:
+            raise ValueError(
+                f"face exposure out of range: {brightness:.1f}, "
+                f"expected={self.min_brightness:.1f}-{self.max_brightness:.1f}"
+            )
+
+        size_score = min(1.0, min(face_width, face_height) / 180.0)
+        sharpness_score = min(1.0, blur_variance / 250.0)
+        exposure_score = max(0.0, 1.0 - abs(brightness - 130.0) / 130.0)
+        quality = (
+            confidence * 0.45
+            + size_score * 0.25
+            + sharpness_score * 0.20
+            + exposure_score * 0.10
+        )
+        return FaceEncoding(
+            embedding=tuple(_normalise_embedding(largest["embedding"])),
+            detection_confidence=confidence,
+            face_width=face_width,
+            face_height=face_height,
+            blur_variance=blur_variance,
+            brightness=brightness,
+            quality=quality,
+        )
