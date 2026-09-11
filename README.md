@@ -1,6 +1,7 @@
 # Embodied Vision
 
 ![Status](https://img.shields.io/badge/status-research%20prototype-6f42c1)
+[![CI](https://github.com/taka-k22/embodied-vision/actions/workflows/test.yml/badge.svg?branch=codex%2Fdeepsort)](https://github.com/taka-k22/embodied-vision/actions/workflows/test.yml?query=branch%3Acodex%2Fdeepsort)
 ![Perception](https://img.shields.io/badge/perception-YOLO%20%2B%20BoT--SORT-00A67E)
 ![Identity](https://img.shields.io/badge/identity-InsightFace%20buffalo__l-0b7285)
 ![Runtime](https://img.shields.io/badge/runtime-Python%203.11-3776AB?logo=python&logoColor=white)
@@ -417,7 +418,9 @@ The regression suite currently contains 15 passing tests covering:
 - short-occlusion track lifecycle;
 - conversion of Ultralytics tracking results into plain observations.
 
-The suite is deterministic and does not require a camera, model download, or GPU. Hardware-in-the-loop, real-video regression, Kernel contract testing, and Jetson performance gates are not yet automated.
+GitHub Actions runs Ruff linting, the regression suite, Python compilation, and dashboard JavaScript syntax validation on Windows and Ubuntu with Python 3.11. CI runs on pull requests, pushes to `main` or `codex/**`, and manual dispatch. Concurrent superseded runs are cancelled, and workflow permissions are read-only.
+
+The suite is deterministic and does not require a camera, model download, or GPU. Hardware-in-the-loop, real-video regression, Kernel contract testing, and Jetson performance gates are not automated.
 
 ## License
 

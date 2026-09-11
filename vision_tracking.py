@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,7 @@ def observations_from_result(result) -> list[TrackObservation]:
             confidences,
             classes,
             track_ids,
+            strict=True,
         )
     ]
 
