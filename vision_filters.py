@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from collections.abc import Iterable
 
 
 def is_plausible_person_detection(
@@ -30,7 +30,7 @@ def resolve_duplicate_identity_track(
     *,
     candidate_track_id: str,
     existing_tracks: Iterable[tuple[str, int]],
-) -> Optional[tuple[str, str]]:
+) -> tuple[str, str] | None:
     """Return ``(kept, dropped)`` for duplicate tracks of one person.
 
     A currently updated owner wins. If every existing owner is stale, the new

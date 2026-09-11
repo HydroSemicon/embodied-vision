@@ -6,23 +6,22 @@ in memory and are never written to disk by this module.
 
 from __future__ import annotations
 
-from collections import Counter
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 import math
-from pathlib import Path
 import threading
 import uuid
+from collections import Counter
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from statistics import median
-from typing import Iterable, Optional
-
 
 REGISTRY_VERSION = 1
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _normalise_embedding(values: Iterable[float]) -> list[float]:
@@ -82,7 +81,11 @@ def cosine_distance(left: Iterable[float], right: Iterable[float]) -> float:
         raise ValueError("embedding dimensions must match")
     similarity = sum(
         left_value * right_value
-        for left_value, right_value in zip(left_normalised, right_normalised)
+        for left_value, right_value in zip(
+            left_normalised,
+            right_normalised,
+            strict=True,
+        )
     )
     return 1.0 - max(-1.0, min(1.0, similarity))
 
@@ -161,13 +164,13 @@ def select_representative_encodings(
 
 
 def resolve_face_vote(
-    candidates: Iterable[Optional[FaceMatch]],
+    candidates: Iterable[FaceMatch | None],
     *,
     window_size: int,
     min_votes: int,
     min_vote_ratio: float,
     consecutive_matches: int = 0,
-) -> Optional[FaceVote]:
+) -> FaceVote | None:
     recent = list(candidates)[-max(1, window_size) :]
     if not recent:
         return None
@@ -304,16 +307,16 @@ class FaceRegistry:
                 )
             ]
 
-    def match(self, embedding: Iterable[float]) -> Optional[FaceMatch]:
+    def match(self, embedding: Iterable[float]) -> FaceMatch | None:
         best = self.nearest(embedding)
         if best is None or best.distance > self.threshold:
             return None
         return best
 
-    def nearest(self, embedding: Iterable[float]) -> Optional[FaceMatch]:
+    def nearest(self, embedding: Iterable[float]) -> FaceMatch | None:
         """Return the nearest registered face even when it exceeds the threshold."""
         candidate = _normalise_embedding(embedding)
-        best: Optional[FaceMatch] = None
+        best: FaceMatch | None = None
 
         with self._lock:
             for person in self._people.values():
@@ -321,7 +324,8 @@ class FaceRegistry:
                     if len(candidate) != len(reference):
                         continue
                     similarity = sum(
-                        left * right for left, right in zip(candidate, reference)
+                        left * right
+                        for left, right in zip(candidate, reference, strict=True)
                     )
                     distance = 1.0 - max(-1.0, min(1.0, similarity))
                     if best is None or distance < best.distance:
@@ -407,8 +411,8 @@ class InsightFaceEncoder:
         self,
         *,
         model_name: str,
-        providers: Optional[Iterable[str]] = None,
-        model_root: Optional[str] = None,
+        providers: Iterable[str] | None = None,
+        model_root: str | None = None,
         detection_size: int = 640,
         require_accelerator: bool = False,
         min_face_size: int = 70,

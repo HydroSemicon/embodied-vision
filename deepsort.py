@@ -1,20 +1,19 @@
 from __future__ import annotations
 
-from collections import defaultdict, deque
-from datetime import datetime, timezone
 import os
-from pathlib import Path
-from queue import Empty, Full, Queue
 import threading
 import time
-from typing import Optional
 import uuid
+from collections import defaultdict, deque
+from datetime import UTC, datetime
+from pathlib import Path
+from queue import Empty, Full, Queue
 
 import cv2  # type: ignore
-from flask import Flask, Response, jsonify, render_template, request  # type: ignore
 import requests  # type: ignore
-from ultralytics import YOLO  # type: ignore
 import yaml  # type: ignore
+from flask import Flask, Response, jsonify, render_template, request  # type: ignore
+from ultralytics import YOLO  # type: ignore
 
 from face_registry import (
     FaceEncoding,
@@ -24,12 +23,11 @@ from face_registry import (
     resolve_face_vote,
     select_representative_encodings,
 )
-from vision_tracking import TrackLifecycle, observations_from_result
 from vision_filters import (
     is_plausible_person_detection,
     resolve_duplicate_identity_track,
 )
-
+from vision_tracking import TrackLifecycle, observations_from_result
 
 BASE_DIRECTORY = Path(__file__).resolve().parent
 
@@ -190,7 +188,7 @@ face_event_send_enabled = FACE_EVENT_SEND_DEFAULT_ENABLED
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def face_events_enabled() -> bool:
@@ -249,8 +247,8 @@ def send_person_event(
     event_type: str,
     track_id: str,
     *,
-    position: Optional[str] = None,
-    identity: Optional[dict] = None,
+    position: str | None = None,
+    identity: dict | None = None,
 ) -> bool:
     identity_payload = identity or pending_identity(
         "pending" if FACE_RECOGNITION_ENABLED else "unavailable"
@@ -337,14 +335,14 @@ class FaceRecognitionService:
         self.lock = threading.RLock()
         self.sample_condition = threading.Condition(self.lock)
         self.worker_status = "disabled" if not enabled else "starting"
-        self.worker_error: Optional[str] = None
+        self.worker_error: str | None = None
         self.last_submitted: dict[str, float] = {}
         self.latest_embeddings: dict[str, list[float]] = {}
         self.identities: dict[str, dict] = {}
         self.active_tracks: set[str] = set()
         self.track_staleness: dict[str, int] = {}
         self.superseded_tracks: set[str] = set()
-        self.candidate_history: dict[str, deque[Optional[FaceMatch]]] = defaultdict(
+        self.candidate_history: dict[str, deque[FaceMatch | None]] = defaultdict(
             lambda: deque(
                 maxlen=max(
                     1,
@@ -996,9 +994,9 @@ def annotated_frame_stream():
 
         with frame_condition:
             frame_condition.wait_for(
-                lambda: (
+                lambda previous_sequence=last_sequence: (
                     latest_annotated_frame is not None
-                    and latest_frame_sequence != last_sequence
+                    and latest_frame_sequence != previous_sequence
                 ),
                 timeout=1.0,
             )
