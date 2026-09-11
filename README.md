@@ -1,121 +1,174 @@
 # Embodied Vision
 
-YOLO + BoT-SORTによる人物追跡と、InsightFaceによる登録人物照合を行うローカルサービスです。
+![Status](https://img.shields.io/badge/status-research%20prototype-6f42c1)
+![Perception](https://img.shields.io/badge/perception-YOLO%20%2B%20BoT--SORT-00A67E)
+![Identity](https://img.shields.io/badge/identity-InsightFace%20buffalo__l-0b7285)
+![Runtime](https://img.shields.io/badge/runtime-Python%203.11-3776AB?logo=python&logoColor=white)
+![Acceleration](https://img.shields.io/badge/acceleration-CUDA-76B900?logo=nvidia&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-15%20passing-2ea44f)
+![License](https://img.shields.io/badge/license-MIT-blue)
 
-## 動作
+Embodied Vision is the person-perception and identity service for the Waifu 3.0 research platform. It detects people in a robot camera feed, maintains short-lived visual tracks, resolves registered identities, supports multi-view face enrollment, and emits bounded identity events to Kokomi Kernel.
 
-- YOLOで検出した人物を、外観ReIDとカメラ動き補正を有効にしたBoT-SORTの`track_id`で追跡します。
-- 人物を登録人物または未登録人物として確定したときだけ、`kokomi_kernel`へ通知します。
-- 顔照合は追跡ループとは別のワーカースレッドで実行します。
-- InsightFaceのSCRFDで顔を検出・位置合わせし、小さすぎる顔、ぼけ、露出不良を除外します。
-- `buffalo_l`の複数フレーム投票で人物を確定し、単発の誤判定を抑えます。
-- 同じ登録人物が複数のtrack IDで検出された場合は1つへ統合し、認識・離脱イベントの重複を防ぎます。
-- 未登録判定は十分な時間と高品質な不一致サンプルがそろうまで保留します。
-- 登録時は最大30秒間サンプルを集め、外れ値と重複を除いた複数の特徴ベクトルを保存します。顔画像は保存しません。
+The camera is a conversational sensor. Its output is intended to support dialogue about visible people and scenes, not geometric measurement, ranging, localization, surveillance, or biometric access control.
 
-## セットアップ
+## System status
 
-Python 3.11環境で以下を実行します。
+| Area | Current state | Operational meaning |
+| --- | --- | --- |
+| Person detection | Implemented | YOLO detections are filtered by confidence, size, and frame-area ratio |
+| Person tracking | Implemented | Ultralytics BoT-SORT maintains track IDs with ReID and camera-motion compensation |
+| Face detection and alignment | Implemented | InsightFace SCRFD extracts the most plausible face from each person crop |
+| Registered identity matching | Implemented | `buffalo_l` embeddings are matched by cosine distance and temporal voting |
+| Face enrollment | Implemented | Multiple consistent, high-quality embeddings are selected and persisted |
+| Duplicate identity suppression | Implemented | One registered identity may own at most one active logical track |
+| Kernel event delivery | Implemented | Only resolved identity, enrollment, and disappearance events are emitted |
+| Raw camera snapshot | Implemented | An unannotated frame is available for Kernel-triggered VLM use |
+| Local diagnostics | Implemented | Browser and OpenCV views expose tracking, matching, enrollment, and delivery state |
+| General object event contract | Not implemented | The active Kernel protocol is person-identity-only |
+| Emotion analysis | Deferred | No FER or affect estimate enters runtime state or Kernel events |
 
-```powershell
-pip install -r deepsort-py311requirements.txt
-pip install -r face-recognition-requirements.txt
-# InsightFace 1.0.1が依存関係として入れるCPU版を除去し、CUDA 12版だけを再導入
-pip uninstall -y onnxruntime onnxruntime-gpu
-pip install --no-cache-dir onnxruntime-gpu==1.20.2
-python deepsort.py
+## Architectural model
+
+```mermaid
+flowchart LR
+    CAMERA["Robot camera"]
+    YOLO["YOLO<br/>person detection"]
+    FILTER["Detection plausibility filter"]
+    TRACKER["BoT-SORT<br/>tracking · ReID · GMC"]
+    CROP["Upper-body face search region"]
+    SCRFD["SCRFD<br/>face detection and alignment"]
+    QUALITY["Face quality gates"]
+    EMBED["buffalo_l<br/>face embedding"]
+    VOTE["Temporal identity vote"]
+    REGISTRY["Persistent embedding registry"]
+    EVENTS["Resolved event queue"]
+    KERNEL["Kokomi Kernel"]
+    API["Local HTTP diagnostics"]
+
+    CAMERA --> YOLO
+    YOLO --> FILTER
+    FILTER --> TRACKER
+    TRACKER --> CROP
+    CROP --> SCRFD
+    SCRFD --> QUALITY
+    QUALITY --> EMBED
+    EMBED <--> REGISTRY
+    EMBED --> VOTE
+    VOTE --> EVENTS
+    EVENTS --> KERNEL
+    CAMERA --> API
+    TRACKER --> API
+    VOTE --> API
+    REGISTRY --> API
 ```
 
-InsightFaceの`buffalo_l`モデルパックは初回利用時に取得されます。Windowsでは`onnxruntime-gpu`を使用します。CPU版の`onnxruntime`だけが見つかった場合は、気付かないまま低速動作しないよう顔認識ワーカーをエラーにします。JetsonではJetPackに適合するNVIDIA向けONNX Runtime GPU wheelを使用し、PyPI版が対応しない場合は`face-recognition-requirements.txt`の`onnxruntime-gpu`を除いて個別に導入してください。
+### Authority boundaries
 
-InsightFaceの公開済み事前学習モデルは非商用研究用途です。製品として配布・運用する場合は、使用するモデルのライセンスを別途確認してください。
+- YOLO owns frame-local person detections.
+- BoT-SORT owns frame-to-frame track IDs; a track ID is not a durable person identity.
+- InsightFace owns face detection, alignment, and embedding generation.
+- The face registry owns durable `person_id`, name, and reference embeddings.
+- Temporal voting owns the transition from `pending` to `recognized` or `unknown`.
+- Duplicate suppression owns the one-visible-track-per-registered-identity invariant.
+- Embodied Vision owns perception events; Kokomi Kernel owns persistent world state and cognitive consequences.
+- The LLM may request enrollment through the Kernel, but it never creates or edits face embeddings directly.
 
-## ローカル確認UI
+## Runtime composition
 
-`deepsort.py`を起動して、ブラウザで次を開きます。
+| Component | Responsibility |
+| --- | --- |
+| `deepsort.py` | Runtime composition, camera loop, YOLO inference, BoT-SORT invocation, face worker, event delivery, and HTTP surface |
+| `face_registry.py` | InsightFace adapter, quality gates, cosine matching, temporal voting helpers, representative-sample selection, and persistent registry |
+| `vision_tracking.py` | Conversion of Ultralytics results and short-occlusion track lifecycle |
+| `vision_filters.py` | Implausible person rejection and duplicate identity-track resolution |
+| `botsort.yaml` | Accuracy-first BoT-SORT policy with sparse optical-flow GMC and appearance ReID |
+| `templates/` and `static/` | Local operational console and annotated MJPEG view |
+| `tests/` | Deterministic regression contract for registry, voting, filtering, duplicate suppression, and track lifecycle |
+| `archive/` | Historical experiments, superseded dependency manifests, and development-only utilities |
+
+The entry-point name and outbound `source: "deepsort"` value are retained for compatibility. The active tracking implementation is BoT-SORT; no DeepSORT library is used.
+
+## Perception pipeline
+
+### Person detection and tracking
+
+1. YOLO runs in person-only mode.
+2. Detections below configured confidence, pixel size, or frame-area thresholds are rejected.
+3. BoT-SORT associates accepted detections using motion, detection confidence, appearance features, and sparse optical-flow camera-motion compensation.
+4. Logical tracks remain alive for a bounded missing-frame interval to bridge short occlusions.
+5. A track that has not reached a resolved identity state produces no Kernel event.
+
+BoT-SORT configuration is loaded from `VISION_TRACKER_CONFIG`. At runtime, `track_high_thresh`, `new_track_thresh`, `track_low_thresh`, and `track_buffer` are overwritten from the corresponding environment policy and written to `data/botsort_runtime.yaml`.
+
+### Face extraction and quality
+
+Only the upper portion of an accepted person box is submitted to the asynchronous face worker. SCRFD chooses the detected face with the strongest confidence-area score. A sample is rejected when any of these gates fail:
+
+- minimum face width or height;
+- minimum SCRFD detection confidence;
+- Laplacian blur variance;
+- grayscale brightness range;
+- valid aligned embedding availability.
+
+Accepted samples expose quality metadata for diagnostics but only normalized embeddings enter the registry.
+
+### Identity matching
+
+Each normalized live embedding is compared with every stored exemplar using cosine distance:
 
 ```text
-http://localhost:5000/
+distance = 1 - cosine_similarity(live_embedding, stored_embedding)
 ```
 
-Aliceや`kokomi_kernel`を起動しなくても、以下を確認・操作できます。
+Lower values indicate greater similarity. A candidate is eligible only when its distance does not exceed `FACE_MATCH_THRESHOLD`.
 
-- 追跡ラベル付きカメラ映像
-- カメラ、InsightFaceワーカー、ONNX実行プロバイダ、イベント送信の稼働状態
-- 現在の`track_id`、照合状態、最近傍候補、コサイン距離
-- 登録済み人物と保存されている特徴量サンプル数
-- 現在見えている人物の顔登録
-- Aliceへの人物・顔イベント送信のON/OFF
+Recognition becomes authoritative by either:
 
-主な環境変数：
+- the same identity matching in two consecutive accepted samples; or
+- at least three matching votes in the latest eight samples with a minimum 0.6 vote ratio.
 
-| 変数 | 既定値 | 用途 |
-|---|---:|---|
-| `VISION_EVENT_SEND_ENABLED` | `true` | Aliceへのイベント送信 |
-| `FACE_EVENT_SEND_ENABLED` | `true` | 起動時の人物・顔イベント送信状態 |
-| `VISION_EVENT_URL` | `http://localhost:3000/yolo_event` | イベント送信先 |
-| `VISION_EVENT_REQUEST_TIMEOUT_SECONDS` | `10.0` | Aliceへの1回の送信待ち時間 |
-| `VISION_HTTP_HOST` | `127.0.0.1` | HTTP APIの待受アドレス |
-| `VISION_HTTP_PORT` | `5000` | HTTP APIの待受ポート |
-| `VISION_DISPLAY_ENABLED` | `true` | OpenCVウィンドウ表示 |
-| `VISION_UI_STREAM_FPS` | `30` | ブラウザ映像の最大配信fps（最大120） |
-| `VISION_UI_JPEG_QUALITY` | `90` | ブラウザ映像のJPEG品質（50〜100） |
-| `VISION_YOLO_CONFIDENCE` | `0.50` | 新しい人物トラックを開始する最低信頼度 |
-| `VISION_YOLO_TRACK_CONFIDENCE` | `0.10` | BoT-SORTが既存トラックとの再関連付けに使う低信頼度検出の下限 |
-| `VISION_YOLO_MIN_PERSON_WIDTH` | `40` | 人物候補の最小幅（px） |
-| `VISION_YOLO_MIN_PERSON_HEIGHT` | `80` | 人物候補の最小高さ（px） |
-| `VISION_YOLO_MIN_PERSON_AREA_RATIO` | `0.002` | 人物候補が画面に占める最低面積比 |
-| `FACE_RECOGNITION_ENABLED` | `true` | 登録顔照合 |
-| `VISION_TRACKER_CONFIG` | `botsort.yaml` | BoT-SORT設定ファイル。既定ではReIDとカメラ動き補正を有効化 |
-| `FACE_MODEL_NAME` | `buffalo_l` | InsightFaceのモデルパック |
-| `FACE_MATCH_THRESHOLD` | `0.55` | コサイン距離の一致上限 |
-| `FACE_EXECUTION_PROVIDERS` | `CUDAExecutionProvider,CPUExecutionProvider` | 優先するONNX Runtime実行プロバイダ。JetsonでTensorRTを使う場合は先頭へ追加 |
-| `FACE_REQUIRE_GPU` | `true` | TensorRT/CUDAが使えない場合にCPUへ黙ってフォールバックせずエラーにする |
-| `FACE_MODEL_ROOT` | InsightFace既定値 | モデル保存ルート。未指定ならInsightFaceの標準保存先 |
-| `FACE_CONFIRMATIONS` | `3` | 認識確定に必要な投票数 |
-| `FACE_RECOGNITION_WINDOW` | `8` | 認識投票に使う直近サンプル数 |
-| `FACE_RECOGNITION_MIN_VOTE_RATIO` | `0.6` | 認識確定に必要な投票比率 |
-| `FACE_CONSECUTIVE_CONFIRMATIONS` | `2` | 同一人物の連続一致による早期確定回数 |
-| `FACE_UNKNOWN_CONFIRMATIONS` | `40` | 未登録確定に必要な高品質不一致数 |
-| `FACE_UNKNOWN_MIN_SECONDS` | `15.0` | 未登録確定までの最低観測時間 |
-| `FACE_ANALYSIS_INTERVAL_SECONDS` | `0.25` | 同一トラックの顔解析間隔 |
-| `FACE_MIN_FACE_SIZE` | `70` | 採用する顔の最小幅・高さ（px） |
-| `FACE_MIN_DETECTION_CONFIDENCE` | `0.70` | 採用するSCRFD顔検出信頼度 |
-| `FACE_MIN_BLUR_VARIANCE` | `35.0` | ぼけ除外のしきい値 |
-| `FACE_INPUT_MAX_DIMENSION` | `640` | InsightFaceへ渡す人物切り出し画像の最大辺（px） |
-| `FACE_DETECTION_SIZE` | `640` | SCRFDの検出入力サイズ |
-| `FACE_PERSON_CROP_TOP_RATIO` | `0.75` | 人物枠の上側から顔を探す範囲 |
-| `FACE_ENROLLMENT_SECONDS` | `30.0` | 非同期登録セッションの最大時間 |
-| `FACE_ENROLLMENT_MIN_SECONDS` | `8.0` | 登録時に観測する最低時間 |
-| `FACE_ENROLLMENT_MIN_SAMPLES` | `4` | 登録成立に必要な一貫した代表サンプル数 |
-| `FACE_ENROLLMENT_TARGET_SAMPLES` | `8` | 登録時に集める目標サンプル数 |
-| `FACE_ENROLLMENT_EXEMPLARS` | `8` | 1回の登録で選ぶ代表特徴量数 |
-| `FACE_MAX_EMBEDDINGS_PER_PERSON` | `12` | 1人あたりの最大保存特徴量数 |
-| `FACE_REGISTRY_PATH` | `data/face_registry_buffalo_l.json` | 登録データ保存先 |
-| `TRACK_MAX_AGE` | `90` | BoT-SORTとイベント層が消失トラックを保持するフレーム数 |
+The reported distance is the median of the winning evidence. Once a track is recognized, repeated face analysis stops unless an enrollment session is explicitly started.
 
-## HTTP API
+### Unknown resolution
 
-- `GET /status`：カメラ・顔認識ワーカーの状態
-- `GET /face-events`：人物・顔イベント送信スイッチの状態
-- `POST /face-events`：人物・顔イベント送信の有効・無効を実行中に変更
-- `GET /snapshot`：Aliceに渡す生画像
-- `GET /snapshot/annotated`：IDと認識名を描画した確認画像
-- `GET /stream/annotated`：UI用の追跡ラベル付きMJPEGストリーム
-- `GET /tracks`：現在のトラックと認識状態
-- `GET /faces`：登録人物一覧。顔特徴ベクトルは返しません
-- `POST /faces/enroll`：現在のトラックの非同期登録を開始（`202 collecting`）
+`unknown` is a confirmed state, not the absence of a match on one frame. It requires both:
 
-## `kokomi_kernel`へ送るイベント
+- at least 15 seconds since the first accepted face sample; and
+- 40 consecutive high-quality samples without an eligible registered match.
 
-人物・顔イベントは、既定では次のエンドポイントへHTTP POSTします。
+No face, poor-quality face, a transient detector failure, or a short-lived yellow track does not produce `person_unknown`.
 
-```text
-POST http://localhost:3000/yolo_event
-Content-Type: application/json
-```
+### Duplicate identity invariant
 
-送信先は`VISION_EVENT_URL`で変更できます。すべてのイベントは次の共通形式です。
+A registered `person_id` may own only one active logical track.
+
+- If the existing owner and a new duplicate box are both current, the existing owner is retained and the new track is suppressed.
+- If the existing owner is only a stale motion prediction, ownership transfers to the fresh track.
+- Ownership transfer does not emit a false disappearance/reappearance pair.
+- Suppressed tracks cannot emit recognition or disappearance events.
+
+## Face enrollment contract
+
+Enrollment binds an active `track_id` to a bounded display name. Collection is asynchronous and temporarily owns the identity decision for that track, preventing an `unknown` event from racing enrollment completion.
+
+| Property | Default contract |
+| --- | --- |
+| Maximum collection time | 30 s |
+| Minimum observation time | 8 s |
+| Target accepted samples | 8 |
+| Minimum representative samples | 4 |
+| Representative embeddings selected per enrollment | Up to 8 |
+| Stored embeddings per person | Up to 12 |
+| Name length | 1–80 characters, excluding control characters |
+
+Samples are clustered by embedding consistency. Isolated outliers and near-duplicate samples are removed, then a quality/diversity score selects representative exemplars. Re-enrolling the same case-insensitive name extends the existing identity instead of creating a second person.
+
+The registry stores embeddings and identity metadata only. Camera frames and face crops remain in memory and are never written by the face registry.
+
+## Kokomi Kernel event contract
+
+Resolved events are sent by HTTP POST to `VISION_EVENT_URL`, whose default is `http://localhost:3000/yolo_event`. The body is one JSON envelope:
 
 ```json
 {
@@ -137,80 +190,235 @@ Content-Type: application/json
 }
 ```
 
-`event_id`はイベントごとに生成する一意なIDです。同じイベントの再試行では変更しないため、受信側はこの値で重複を除外できます。`timestamp`はUTCのISO 8601形式、`track_id`は文字列です。
+### Common fields
 
-### イベント種別
+| Field | Contract |
+| --- | --- |
+| `event_id` | Unique lowercase hexadecimal event identifier; unchanged across delivery retries |
+| `source` | Always `deepsort` for Kernel compatibility |
+| `type` | One of the four resolved event types below |
+| `track_id` | String representation of the current visual track |
+| `timestamp` | UTC ISO 8601 observation timestamp |
+| `identity.status` | `recognized` or `unknown` for emitted identity events; the last resolved value on disappearance |
+| `identity.person_id` | Durable registry ID for recognized identities; otherwise `null` |
+| `identity.name` | Registered display name for recognized identities; otherwise `null` |
+| `identity.distance` | Cosine distance for a recognition; `0.0` immediately after enrollment; otherwise `null` |
+| `identity.threshold` | Configured acceptance boundary |
+| `position` | Optional `left`, `center`, or `right`; currently attached to disappearance when known |
+| `message` | Stable English summary intended for downstream interpretation |
 
-| `type` | 送信条件 | 追加情報 |
-|---|---|---|
-| `person_recognized` | 登録人物との照合が確定 | 同一人物の2回連続一致、または通常の複数票で確定 |
-| `person_unknown` | 15秒以上観測し、高品質な不一致が40件連続 | 一時的な顔検出失敗だけでは送信しない |
-| `person_enrolled` | 顔登録がバックグラウンドで完了 | 登録直後なので`identity.distance`は`0.0` |
-| `person_disappeared` | `person_recognized`、`person_unknown`または`person_enrolled`を通知済みの人物トラックが消失 | 最後の`identity`と`position`を設定 |
+### Event types
 
-`identity`は常に以下の5フィールドを持ちます。
+| Type | Emission condition | Suppression rule |
+| --- | --- | --- |
+| `person_recognized` | Temporal matching resolves a registered identity | Emitted once per logical visible identity episode |
+| `person_unknown` | Time and consecutive mismatch requirements both resolve | Suppressed during enrollment and for unusable faces |
+| `person_enrolled` | A multi-sample enrollment is persisted successfully | Becomes the identity announcement for that visible track |
+| `person_disappeared` | A previously announced resolved track exceeds its missing-frame lifetime | Never emitted for an unannounced pending track or a suppressed duplicate |
 
-| フィールド | 内容 |
-|---|---|
-| `status` | `pending`、`recognized`、`unknown`、`unavailable`のいずれか |
-| `person_id` | 登録人物のID。未確定時は`null` |
-| `name` | 登録名。未確定時は`null` |
-| `distance` | 登録特徴量とのコサイン距離。小さいほど一致。未確定時は`null` |
-| `threshold` | 一致判定に使用した距離の上限 |
+`person_appeared` is intentionally not emitted. Detection alone is too unstable to be a cognitive event.
 
-### 通常の送信順序
+### Event lifecycle
 
-人物を検出しただけではイベントを送りません。登録人物または未登録人物として確定してから通知します。顔を取得できない人物や、YOLOが一時的に誤検出した黄色枠からはイベントを送りません。
-
-```text
-人物出現
-  ├─ 登録人物との照合成功
-  │    person_recognized
-  │    → その人物が離れたら person_disappeared
-  │
-  ├─ 顔を取得できない・人物候補が短時間で消える
-  │    イベントなし
-  │
-  └─ 顔は取得できるが未登録
-       15秒以上かつ不一致40件後 person_unknown
-       → その人物が離れたら person_disappeared
+```mermaid
+stateDiagram-v2
+    [*] --> Pending: accepted person track
+    Pending --> Recognized: registered identity confirmed
+    Pending --> Unknown: unknown evidence confirmed
+    Pending --> Enrolling: enrollment requested
+    Enrolling --> Recognized: enrollment persisted
+    Enrolling --> Pending: enrollment rejected
+    Recognized --> Disappeared: track lifetime expires
+    Unknown --> Disappeared: track lifetime expires
+    Pending --> [*]: unresolved track expires
+    Disappeared --> [*]
 ```
 
-`person_appeared`は送信しません。登録セッション中は`person_unknown`を抑制し、登録成功後に`person_enrolled`を送ります。`person_disappeared`も、認識結果または登録完了を一度も通知していないトラックについては送信しません。
+### Delivery semantics
 
-### 配信とイベントスイッチ
+- Events enter a bounded asynchronous queue of 100 items.
+- Delivery attempts use delays of 0, 0.2, 0.5, and 1.0 seconds.
+- Every retry retains the same `event_id` so the Kernel can deduplicate safely.
+- A full queue drops the newly generated event instead of blocking the perception loop.
+- Disabling face events immediately drains queued events.
+- Re-enabling delivery does not replay events generated while disabled.
+- Event delivery state does not stop camera capture, YOLO, tracking, matching, enrollment, snapshots, or the diagnostic UI.
 
-イベントは最大100件の非同期キューから送信します。HTTP送信に失敗した場合は、同じ`event_id`のまま待ち時間`0`、`0.2`、`0.5`、`1.0`秒で最大4回試行します。キューが満杯の場合は新しいイベントを破棄します。
+## Local HTTP surface
 
-`VISION_EVENT_SEND_ENABLED=false`または実行中の顔イベントスイッチがOFFの場合、人物・顔イベントは送信しません。スイッチをOFFにした時点で待機中のイベントも破棄し、ONへ戻しても過去のイベントは再送しません。カメラ、YOLO、BoT-SORT、InsightFace、顔登録、スナップショットAPIはそのまま動作を続けます。
+The default listener is `127.0.0.1:5000`.
 
-OpenCVウィンドウでは`E`キーでも人物・顔イベント送信を切り替えられます。
+| Method | Route | Response contract |
+| --- | --- | --- |
+| GET | `/` | Local operational console |
+| GET | `/status` | Camera, event queue, face worker, execution-provider, quality, enrollment, and stream state; `503` when no camera frame exists |
+| GET | `/face-events` | Current requested and effective event-delivery state |
+| POST | `/face-events` | Exact JSON body `{ "enabled": boolean }`; disabling also drains queued events |
+| GET | `/snapshot` | Latest unannotated camera frame as JPEG; `503` when unavailable |
+| GET | `/snapshot/annotated` | Latest tracking/identity overlay as JPEG; `503` when unavailable |
+| GET | `/stream/annotated` | No-cache multipart MJPEG diagnostic stream |
+| GET | `/tracks` | Active tracks, identity state, face quality/rejection, nearest candidate, evidence count, and enrollment state |
+| GET | `/faces` | Registered identity metadata and embedding counts; raw embeddings are omitted |
+| POST | `/faces/enroll` | Exact JSON body containing `track_id` and `name`; returns `202` when collection starts |
 
-```powershell
-# Aliceへの人物・顔イベントを無効化
-Invoke-RestMethod -Method Post `
-  -Uri http://localhost:5000/face-events `
-  -ContentType application/json `
-  -Body '{"enabled":false}'
+The HTTP surface has no authentication layer. Loopback binding is therefore the default security boundary.
 
-# 再び有効化
-Invoke-RestMethod -Method Post `
-  -Uri http://localhost:5000/face-events `
-  -ContentType application/json `
-  -Body '{"enabled":true}'
+## Identity and track states
+
+The diagnostics API may report four identity states:
+
+| State | Meaning |
+| --- | --- |
+| `pending` | A live track exists but identity evidence is not yet authoritative |
+| `recognized` | A registered identity has passed temporal confirmation or enrollment |
+| `unknown` | Sustained high-quality mismatch evidence has passed the unknown policy |
+| `unavailable` | Face recognition is disabled or its worker failed |
+
+Track IDs are process-local and disposable. `person_id` is the durable identity key.
+
+## Persistence and privacy
+
+The default registry is `data/face_registry_buffalo_l.json`.
+
+```json
+{
+  "version": 1,
+  "model": "buffalo_l",
+  "distance_metric": "cosine",
+  "people": [
+    {
+      "person_id": "<uuid>",
+      "name": "KOT",
+      "created_at": "<ISO-8601>",
+      "updated_at": "<ISO-8601>",
+      "embeddings": [["<normalized floating-point vector>"]]
+    }
+  ]
+}
 ```
 
-登録例：
+- Writes use a temporary file followed by replacement.
+- Registry model names must match the configured embedding model.
+- Embeddings from SFace, Facenet512, and `buffalo_l` are not interchangeable and are not migrated automatically.
+- Registry files, temporary files, and generated BoT-SORT runtime configuration are excluded from source control.
+- Biometric embeddings remain sensitive personal data even though source images are not stored.
+- InsightFace pretrained model licensing must be evaluated separately for any use beyond non-commercial research.
 
-```powershell
-Invoke-RestMethod -Method Post `
-  -Uri http://localhost:5000/faces/enroll `
-  -ContentType application/json `
-  -Body '{"track_id":"7","name":"たかん"}'
-```
+## Configuration contract
 
-Aliceからは`remember_person`アクションで同じAPIを呼び出せます。APIは収集開始時に`202 collecting`を返し、Python側は最大30秒間バックグラウンドで顔を集めます。正面を見てから顔をゆっくり左右へ向けてください。8秒以上かつ目標8サンプルで早期完了し、30秒時点で一貫した代表サンプルが4個未満なら保存しません。進捗と最終結果は`GET /tracks`およびブラウザUIに表示され、成功時は`person_enrolled`イベントがAliceへ送られます。同じ名前で再登録すると、最大12個まで代表特徴ベクトルが追加されます。
+### Service and delivery
 
-以前のSFace登録は`data/face_registry.json`、Facenet512登録は`data/face_registry_facenet512.json`に残りますが、`buffalo_l`の特徴量とは互換性がないため自動変換しません。この構成へ切り替えた初回は人物を再登録してください。
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `VISION_EVENT_SEND_ENABLED` | `true` | Process-wide master event-delivery policy |
+| `FACE_EVENT_SEND_ENABLED` | `true` | Initial runtime face-event switch state |
+| `VISION_EVENT_URL` | `http://localhost:3000/yolo_event` | Kokomi Kernel event endpoint |
+| `VISION_EVENT_REQUEST_TIMEOUT_SECONDS` | `10.0` | Timeout for one HTTP delivery attempt |
+| `VISION_HTTP_HOST` | `127.0.0.1` | Local HTTP bind address |
+| `VISION_HTTP_PORT` | `5000` | Local HTTP port |
+| `VISION_DISPLAY_ENABLED` | `true` | OpenCV diagnostic window policy |
+| `VISION_UI_STREAM_FPS` | `30` | MJPEG stream limit, clamped to 1–120 fps |
+| `VISION_UI_JPEG_QUALITY` | `90` | MJPEG quality, clamped to 50–100 |
 
-`source`はカーネルとの後方互換性のため引き続き`deepsort`を送ります。内部の追跡器がBoT-SORTへ変わっても、イベントの種類・JSON構造・受信URLに変更はありません。
+### Detection and tracking
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `VISION_CAMERA_INDEX` | `0` | OpenCV camera device index |
+| `VISION_YOLO_MODEL` | `yolov8n.pt` | YOLO model path |
+| `VISION_YOLO_CONFIDENCE` | `0.50` | New-track and high-confidence threshold |
+| `VISION_YOLO_TRACK_CONFIDENCE` | `0.10` | Low-confidence association floor |
+| `VISION_YOLO_MIN_PERSON_WIDTH` | `40` | Minimum accepted person-box width in pixels |
+| `VISION_YOLO_MIN_PERSON_HEIGHT` | `80` | Minimum accepted person-box height in pixels |
+| `VISION_YOLO_MIN_PERSON_AREA_RATIO` | `0.002` | Minimum person-box area relative to the frame |
+| `VISION_TRACKER_CONFIG` | `botsort.yaml` | Source BoT-SORT policy |
+| `TRACK_MAX_AGE` | `90` | Missing-frame lifetime for tracker and event state |
+
+### Face recognition and quality
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FACE_RECOGNITION_ENABLED` | `true` | Face worker and identity matching policy |
+| `FACE_MODEL_NAME` | `buffalo_l` | InsightFace model pack and registry namespace |
+| `FACE_MODEL_ROOT` | InsightFace default | Model storage root |
+| `FACE_MATCH_THRESHOLD` | `0.55` for supported buffalo models | Maximum accepted cosine distance |
+| `FACE_EXECUTION_PROVIDERS` | `CUDAExecutionProvider,CPUExecutionProvider` | Requested ONNX Runtime provider priority |
+| `FACE_REQUIRE_GPU` | `true` | Reject silent CPU fallback when no accelerator owns the sessions |
+| `FACE_ANALYSIS_INTERVAL_SECONDS` | `0.25` | Minimum face-analysis interval per track |
+| `FACE_MIN_PERSON_WIDTH` | `100` | Minimum person crop width submitted to the face worker |
+| `FACE_MIN_PERSON_HEIGHT` | `140` | Minimum person crop height submitted to the face worker |
+| `FACE_PERSON_CROP_TOP_RATIO` | `0.75` | Top fraction of the person box searched for faces |
+| `FACE_INPUT_MAX_DIMENSION` | `640` | Maximum submitted crop edge |
+| `FACE_DETECTION_SIZE` | `640` | SCRFD square detection input |
+| `FACE_MIN_FACE_SIZE` | `70` | Minimum accepted face width and height |
+| `FACE_MIN_DETECTION_CONFIDENCE` | `0.70` | Minimum SCRFD confidence |
+| `FACE_MIN_BLUR_VARIANCE` | `35.0` | Minimum Laplacian sharpness variance |
+| `FACE_MIN_BRIGHTNESS` | `35.0` | Minimum mean grayscale brightness |
+| `FACE_MAX_BRIGHTNESS` | `225.0` | Maximum mean grayscale brightness |
+
+### Temporal identity and enrollment
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FACE_CONFIRMATIONS` | `3` | Minimum winning votes in the normal recognition path |
+| `FACE_RECOGNITION_WINDOW` | `8` | Recent sample window used for voting |
+| `FACE_RECOGNITION_MIN_VOTE_RATIO` | `0.6` | Minimum winner share of the vote window |
+| `FACE_CONSECUTIVE_CONFIRMATIONS` | `2` | Consecutive identical matches required for fast recognition |
+| `FACE_UNKNOWN_CONFIRMATIONS` | `40` | Consecutive accepted mismatches required for `unknown` |
+| `FACE_UNKNOWN_MIN_SECONDS` | `15.0` | Minimum unknown-observation duration |
+| `FACE_OBSERVATION_BUFFER_SIZE` | `64` | Per-track accepted encoding buffer capacity |
+| `FACE_ENROLLMENT_SECONDS` | `30.0` | Enrollment deadline |
+| `FACE_ENROLLMENT_MIN_SECONDS` | `8.0` | Minimum collection duration before early completion |
+| `FACE_ENROLLMENT_MIN_SAMPLES` | `4` | Minimum representative samples required to persist |
+| `FACE_ENROLLMENT_TARGET_SAMPLES` | `8` | Accepted-sample target for early completion |
+| `FACE_ENROLLMENT_EXEMPLARS` | `8` | Maximum representatives selected per enrollment |
+| `FACE_ENROLLMENT_CLUSTER_DISTANCE` | Derived, normally `0.65` | Maximum distance joining samples into a consistency cluster |
+| `FACE_MAX_EMBEDDINGS_PER_PERSON` | `12` | Maximum stored exemplars per durable identity |
+| `FACE_REGISTRY_PATH` | `data/face_registry_<model>.json` | Persistent registry path |
+
+## Operational observability
+
+The local console exposes:
+
+- raw and annotated camera readiness;
+- requested and actual ONNX Runtime execution providers;
+- explicit worker failure when CUDA/TensorRT was requested but sessions fell back to CPU;
+- active track IDs and identity states;
+- current and best registered candidate with distance and threshold;
+- accepted evidence count and most recent quality or rejection reason;
+- enrollment sample count, deadline, and terminal result;
+- registered identities and stored exemplar counts;
+- current event-delivery state and queue depth.
+
+The OpenCV overlay uses green for recognized tracks and yellow for pending or unknown tracks. The `E` key changes the runtime event-delivery switch; Escape terminates the camera loop.
+
+## Safety invariants
+
+1. A raw person detection never emits `person_appeared`.
+2. A single failed face match never establishes `unknown`.
+3. A registered identity cannot own two active logical tracks.
+4. A pending or suppressed track cannot emit `person_disappeared`.
+5. Enrollment requires a currently active visual track and bounded name.
+6. Enrollment persists only a consistent cluster of multiple usable samples.
+7. No source image or face crop is written to the registry.
+8. Disabled event delivery cannot accumulate a backlog for later replay.
+9. Failed Kernel delivery cannot block the camera inference loop indefinitely.
+10. Requested GPU execution cannot silently become CPU execution when `FACE_REQUIRE_GPU` is enabled.
+
+## Verification contract
+
+The regression suite currently contains 15 passing tests covering:
+
+- registry enrollment, matching, reload, bounded exemplars, and duplicate removal;
+- representative-sample clustering and outlier rejection;
+- temporal voting, occasional failed samples, split-identity rejection, and fast consecutive recognition;
+- implausible person-box filtering;
+- duplicate identity ownership and stale-track transfer;
+- short-occlusion track lifecycle;
+- conversion of Ultralytics tracking results into plain observations.
+
+The suite is deterministic and does not require a camera, model download, or GPU. Hardware-in-the-loop, real-video regression, Kernel contract testing, and Jetson performance gates are not yet automated.
+
+## License
+
+The repository source is licensed under the [MIT License](LICENSE). Third-party models and datasets retain their own terms.
